@@ -82,13 +82,74 @@ After workflow completion, `post_process()` is called with the execution results
 
 **Post-process updates:**
 1. Sets `is_currently_running` to `false`
-2. Calculates and sets `next_run_time` based on cron expression
+2. Calls the `branch_rules_set_NextRunTime` edge function to calculate and set `next_run_time`
 3. Updates `last_run_time` to current time
 4. Increments execution counters
 
 ### Step 6: Execution plan update
 
 The local execution plan is updated with the new `next_run_time`. This ensures the local cache matches the database, preventing the rule from being picked up again immediately.
+
+## Next run time calculation
+
+After a branch rule completes execution, RES calls the `branch_rules_set_NextRunTime` edge function to calculate when the rule should run next. This calculation considers both the cron expression and the operation time window.
+
+### How it works
+
+<Steps>
+  <Step title="Fetch rule configuration">
+    The edge function retrieves:
+    - The branch rule's `operation_time_from` and `operation_time_to`
+    - The brand rule's `cron_expression` (or falls back to the rule's cron expression)
+  </Step>
+  
+  <Step title="Calculate next cron occurrence">
+    Using the cron expression, find the next scheduled run time starting from the current time.
+  </Step>
+  
+  <Step title="Check operation window">
+    Verify the calculated time falls within the operation window. If not, iterate through cron occurrences until one falls within the window.
+  </Step>
+  
+  <Step title="Handle window boundaries">
+    If no valid run time exists within today's window, schedule for the start of tomorrow's operation window.
+  </Step>
+  
+  <Step title="Update database">
+    Write the calculated `next_run_time` to the `branch_rules` table.
+  </Step>
+</Steps>
+
+### Cron and operation window interaction
+
+The next run time must satisfy both the cron schedule and the operation window:
+
+| Scenario | Current time | Cron | Operation window | Next run |
+|----------|--------------|------|------------------|----------|
+| Normal | 14:00 | `*/30 * * * *` | 08:00-18:00 | 14:30 |
+| End of window | 17:45 | `*/30 * * * *` | 08:00-18:00 | 08:00 next day |
+| Overnight window | 23:00 | `0 * * * *` | 22:00-06:00 | 00:00 (midnight) |
+| Outside window | 20:00 | `*/15 * * * *` | 08:00-18:00 | 08:00 next day |
+
+### Failed execution handling
+
+If the workflow execution fails, the edge function uses a simplified retry strategy:
+
+- **Next run time:** Current time + 5 minutes
+- **Purpose:** Allow quick retry without waiting for the next cron occurrence
+- **Behavior:** The rule will be picked up again in the next master thread cycle after the 5-minute delay
+
+```
+// Example: Failed execution at 14:32
+// Normal cron would schedule 15:00
+// Failed execution schedules 14:37 instead
+```
+
+### Fallback behavior
+
+If the edge function call fails (network issue, database error), RES calculates the next run time locally using the same algorithm. This ensures rules continue to be scheduled even during temporary service disruptions.
+
+The fallback calculation returns: `current_time + 30 minutes`
 
 ## Timeline overview
 

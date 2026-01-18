@@ -66,44 +66,6 @@ The violation system supports multiple attachment formats:
 
 All attachments are uploaded to Supabase storage before the violation is created, ensuring they're accessible via public URLs.
 
-## Setting nextRunTime
-
-After a workflow completes, the branch rule's `next_run_time` is calculated based on its cron expression and operation time window.
-
-### Cron-based scheduling
-
-The next run time is calculated using the cron expression defined on the rule. For example, a cron expression of `*/15 * * * *` means the rule runs every 15 minutes.
-
-### Operation window handling
-
-The `next_run_time` calculation respects operation windows:
-
-<Steps>
-  <Step title="Calculate next cron occurrence">
-    Based on the cron expression, find the next time the rule should run.
-  </Step>
-  
-  <Step title="Check operation window">
-    If the calculated time is outside the operation window, adjust to the next valid time within the window.
-  </Step>
-  
-  <Step title="Handle overnight windows">
-    For windows like 22:00 to 06:00, correctly handle the day boundary by checking if the window spans midnight.
-  </Step>
-</Steps>
-
-**Example scenarios:**
-
-| Current time | Cron | Operation window | Next run |
-|--------------|------|------------------|----------|
-| 14:00 | Every 30 min | 08:00-18:00 | 14:30 |
-| 17:45 | Every 30 min | 08:00-18:00 | 08:00 next day |
-| 23:00 | Every hour | 22:00-06:00 | 00:00 (midnight) |
-
-### Local fallback
-
-If the database update fails, RES calculates `next_run_time` locally to ensure the rule continues to be scheduled correctly. This prevents rules from getting stuck if there's a temporary database issue.
-
 ## Escalation process
 
 Violations can be escalated to brands through multiple channels based on configuration. The escalation flow checks each configured integration and sends notifications accordingly.
@@ -282,14 +244,6 @@ Before deploying to production:
     If getting 401 errors, the refresh token may need to be regenerated in Zoho.
   </Accordion>
   
-  <Accordion title="nextRunTime not updating">
-    Ensure:
-    - Cron expression is valid syntax
-    - Operation time window is properly formatted (`HH:MM:SS`)
-    - Post-process is completing successfully
-    
-    Check the execution plan cache to see the current `next_run_time` value.
-  </Accordion>
 </AccordionGroup>
 
 ## Monitoring violations
