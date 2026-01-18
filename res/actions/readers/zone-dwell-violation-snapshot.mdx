@@ -1,0 +1,197 @@
+---
+title: "Zone dwell violation snapshot"
+description: "Prepare annotated frames for loitering violations from zone dwell records"
+---
+
+The `zone_dwell_violation_snapshot` data action prepares annotated full-frame attachments for loitering violations. It reads records from the `zone_dwell_reader`, finds full-frame attachments, annotates them with bounding boxes and dwell time, and prepares them for the `create_violation` action.
+
+## What it does
+
+The zone dwell violation snapshot action:
+
+1. **Reads records** from the previous `zone_dwell_reader` action result
+2. **Checks for duplicates** using `violated_branch_rules` tracking
+3. **Finds full-frame attachments** in each record's `attachments` field
+4. **Annotates frames** with red bounding boxes and "Loitering [MM:SS]" labels
+5. **Falls back to live capture** if no full-frame attachments are available
+6. **Marks records as violated** to prevent duplicate violations
+7. **Outputs attachments** ready for `create_violation` to consume
+
+## Requirements
+
+| Requirement | Description |
+|-------------|-------------|
+| **Previous zone_dwell_reader** | Must have executed with records in results |
+| **Records with attachments** | Records should have `full_frame` category attachments |
+| **Branch rule ID** | Required for duplicate violation tracking |
+
+## How it works
+
+### Attachment processing
+
+<Steps>
+  <Step title="Extract records">
+    The action retrieves records from the previous `zone_dwell_reader` action's `extras.records`.
+  </Step>
+  
+  <Step title="Check for duplicates">
+    For each record, check if the current `branch_rule_id` is already in the record's `extra_info.violated_branch_rules` list. Skip if already processed.
+  </Step>
+  
+  <Step title="Find full-frame attachments">
+    Look through each record's `attachments` array for entries with `category: 'full_frame'`.
+  </Step>
+  
+  <Step title="Annotate frame">
+    Decode the base64 image, draw a red bounding box using the `bbox` from metadata, and add a "Loitering [MM:SS]" label showing the dwell duration.
+  </Step>
+  
+  <Step title="Create output attachment">
+    Re-encode the annotated image as a new ResultAttachment with metadata including `record_id`, `dwell_seconds`, `zone_name`, and `camera_name`.
+  </Step>
+  
+  <Step title="Mark as violated">
+    After successful processing, add the `branch_rule_id` to the record's `violated_branch_rules` list in the database.
+  </Step>
+</Steps>
+
+### Fallback live capture
+
+If no full-frame attachments are found in the records, the action falls back to live stream capture:
+
+1. Gets the `stream_id` from the first non-violated record
+2. Loads the stream configuration to get the RTSP URL
+3. Attempts capture using multiple methods (GStreamer, OpenCV, Jetson)
+4. Saves the captured frame as the violation attachment
+
+## Duplicate violation prevention
+
+The action implements duplicate tracking at the record level:
+
+| Field | Location | Description |
+|-------|----------|-------------|
+| `violated_branch_rules` | `zone_dwell_events.extra_info` | Array of branch rule IDs that have created violations for this record |
+
+**How it works:**
+- Before processing a record, check if the current `branch_rule_id` is in `violated_branch_rules`
+- If present, skip the record (already processed by this rule)
+- After successfully creating attachments, add the `branch_rule_id` to the list
+- Different rules can still create violations from the same record
+
+This allows multiple rules to create violations from the same dwell event while preventing a single rule from creating duplicate violations.
+
+## Result format
+
+### Success with attachments
+
+| Field | Value |
+|-------|-------|
+| `is_success` | `true` |
+| `feature_result` | `attachments_prepared` |
+| `note` | "Prepared X annotated attachments from Y records" |
+| `extras.attachments` | Array of ResultAttachment dicts (for create_violation) |
+| `extras.records` | Original records (for ANPR or other downstream actions) |
+| `extras.branch_rule_id` | The branch rule ID used for tracking |
+| `extras.records_marked_violated` | Array of record IDs that were marked |
+
+### All duplicates
+
+| Field | Value |
+|-------|-------|
+| `is_success` | `true` |
+| `feature_result` | `all_duplicates` |
+| `note` | "All X records already violated by branch_rule Y" |
+| `extras.attachments` | Empty array |
+| `extras.records_skipped_duplicate` | Count of skipped records |
+
+### No records
+
+| Field | Value |
+|-------|-------|
+| `is_success` | `true` |
+| `feature_result` | `no_records` |
+| `note` | "No records from zone_dwell_reader" |
+| `extras.attachments` | Empty array |
+
+### Fallback capture success
+
+| Field | Value |
+|-------|-------|
+| `is_success` | `true` |
+| `feature_result` | `fallback_snapshot_captured` |
+| `note` | "Fallback snapshot captured for stream X" |
+| `extras.attachments` | Array with single fallback attachment |
+| `detection_attachment_path` | Local file path of captured image |
+
+## Annotation details
+
+The annotation draws:
+
+| Element | Style |
+|---------|-------|
+| **Bounding box** | Red rectangle, 2px line width |
+| **Label background** | Solid red fill |
+| **Label text** | White text: "Loitering [MM:SS]" |
+| **Font** | HERSHEY_SIMPLEX, 0.7 scale, 2px thickness |
+
+The dwell time is calculated from `duration_seconds` in the record, formatted as MM:SS.
+
+## Possible errors
+
+<AccordionGroup>
+  <Accordion title="No full-frame attachments">
+    **What happened:** Records don't have `full_frame` category attachments.
+    
+    **How to fix:**
+    - Ensure the zone dwell engine is configured to capture full frames
+    - Check `full_frame_capture_interval` setting
+    - The action will attempt fallback live capture
+  </Accordion>
+  
+  <Accordion title="Missing bbox metadata">
+    **What happened:** Full-frame attachment doesn't have `bbox` in metadata.
+    
+    **How to fix:**
+    - Ensure zone dwell engine includes bbox when capturing frames
+    - Check that `detection_result` is being stored with bounding box data
+  </Accordion>
+  
+  <Accordion title="Fallback capture failed">
+    **What happened:** Live stream capture failed using all methods.
+    
+    **How to fix:**
+    - Check stream connectivity
+    - Verify RTSP URL is correct
+    - Ensure camera is accessible from the RES server
+  </Accordion>
+</AccordionGroup>
+
+## Workflow integration
+
+This action is the middle step in a loitering violation workflow:
+
+<Steps>
+  <Step title="Query dwell events">
+    `zone_dwell_reader` queries for long-duration dwell events matching violation criteria.
+  </Step>
+  
+  <Step title="Prepare attachments">
+    `zone_dwell_violation_snapshot` annotates frames and prepares attachments.
+  </Step>
+  
+  <Step title="Create violations">
+    `create_violation` uploads attachments and creates violation records.
+  </Step>
+</Steps>
+
+**Example workflow configuration:**
+
+| Node | Action | Purpose |
+|------|--------|---------|
+| 1 | zone_dwell_reader | Query events with duration > threshold |
+| 2 | zone_dwell_violation_snapshot | Annotate frames, skip duplicates |
+| 3 | create_violation | Create violations from attachments |
+
+<Note>
+  The duplicate tracking ensures that even if the workflow runs frequently, each record only produces one violation per branch rule. Different rules can still create separate violations from the same event.
+</Note>

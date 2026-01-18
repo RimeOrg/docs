@@ -1,0 +1,227 @@
+---
+title: "Violations overview"
+description: "Complete guide to violation management in RES"
+---
+
+Violations are records of detected rule breaches. This guide covers the complete violation management system, including creation, status tracking, and delivery to brands.
+
+## What is a violation?
+
+A violation represents a detected event that breached a configured rule. For example:
+- A person detected in a restricted area
+- Smoking detected in a no-smoking zone
+- Equipment left unattended
+- Safety gear not worn
+
+## Violation data model
+
+A violation record contains the following fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | string | Unique identifier |
+| `branch_rule_id` | string | Rule that triggered the violation |
+| `started_at` | string | When the violation started |
+| `ended_at` | string | When the violation ended |
+| `main_attachment` | string[] | Video clips or full images |
+| `sub_attachment` | string[] | Detection crops |
+| `timestamp` | string | Creation timestamp |
+| `note` | string | Additional context |
+| `status` | string | Current status |
+| `created_at` | string | Database creation time |
+| `updated_at` | string | Last update time |
+
+## Violation status workflow
+
+Violations progress through several statuses as they're processed and delivered:
+
+| Status | Arabic | Description |
+|--------|--------|-------------|
+| Created | - | Violation record created, attachments uploaded |
+| Escalated | تأكيد | Ready for brand delivery |
+| Uploaded | رفعت | Delivered to brand's system |
+| Closed | - | Violation resolved |
+
+**Flow:** Created → Escalated → Uploaded → Closed
+
+## Creating violations
+
+Violations are created by the `create_violation` business action. This action:
+
+1. Collects attachments from all previous detection actions
+2. Uploads attachments to Supabase storage
+3. Calls the `insert-violation` edge function to create the record
+4. Returns the violation IDs for subsequent actions
+
+For detailed information, see the [create violation documentation](/res/actions/create-violation).
+
+### Attachment types
+
+<Tabs>
+  <Tab title="Main attachments">
+    **Purpose:** Full context of the violation
+    
+    **Common formats:**
+    - Video clips (`.mp4`, `.webm`) - typically 10-30 seconds
+    - Full-frame images (`.jpg`, `.png`)
+    
+    **Storage:** Uploaded to Supabase `violations` bucket
+  </Tab>
+  
+  <Tab title="Sub attachments">
+    **Purpose:** Focused view of the detection
+    
+    **Common formats:**
+    - Cropped detection images
+    - Annotated snapshots
+    
+    **Storage:** Uploaded to Supabase `violations` bucket
+  </Tab>
+</Tabs>
+
+## Delivery methods
+
+RES supports multiple delivery channels for violations:
+
+### 1. Webhook delivery
+
+Send violation data to an external API endpoint. The webhook payload includes:
+
+| Field | Description |
+|-------|-------------|
+| `violation_id` | Unique identifier |
+| `branch_rule_id` | Rule that triggered the violation |
+| `timestamp` | When the violation occurred |
+| `main_attachment` | Array of video/image URLs |
+| `sub_attachment` | Array of detection crop URLs |
+| `rule_name` | Human-readable rule name |
+| `branch_name` | Human-readable branch name |
+
+### 2. Email delivery
+
+Send formatted HTML email with embedded media. The email includes:
+
+- Violation alert header with rule name
+- Embedded video or image
+- Event timestamp
+- Detection thumbnail
+- Branch and brand information
+
+### 3. Zoho Desk delivery
+
+Create support tickets in the brand's Zoho Desk. Tickets include:
+
+| Field | Value |
+|-------|-------|
+| Subject | Rule name |
+| Description | HTML-formatted violation details with image |
+| Department | Configured department ID |
+| Contact | Configured contact ID |
+| Category | Brand and branch identifier |
+
+## Configuration by brand
+
+Each brand can configure different delivery methods in their brand settings:
+
+| Integration | Required configuration |
+|-------------|----------------------|
+| **Email** | `business_action_email` - recipient email address |
+| **Zoho** | `zoho.enabled`, `zoho.org_id`, `zoho.department_id`, OAuth credentials |
+| **Webhook** | `webhook_url`, optionally `webhook_secret` |
+
+## Violation retrieval flow
+
+For brands with Zoho integration, violations go through a central RIME account:
+
+<Steps>
+  <Step title="Violation created">
+    Detection triggers `create_violation` which stores the violation in the database.
+  </Step>
+  
+  <Step title="Ticket created in RIME Zoho">
+    A ticket is created in RIME's central Zoho account with status "Escalated".
+  </Step>
+  
+  <Step title="Retrieve and forward">
+    The `retrieve_rmts_data` action fetches escalated tickets, filters by branch, and creates tickets in the brand's Zoho account.
+  </Step>
+  
+  <Step title="Mark as delivered">
+    The original RIME ticket is updated to "Uploaded" status.
+  </Step>
+</Steps>
+
+## Best practices
+
+<CardGroup cols={2}>
+  <Card title="Always include attachments" icon="paperclip">
+    Violations without visual evidence are difficult to verify. Ensure detection actions produce both main and sub attachments.
+  </Card>
+  
+  <Card title="Use descriptive notes" icon="note-sticky">
+    Include context in the violation note: zone name, detection type, confidence score.
+  </Card>
+  
+  <Card title="Configure multiple channels" icon="share-nodes">
+    Set up both email and ticketing to ensure violations aren't missed.
+  </Card>
+  
+  <Card title="Monitor delivery failures" icon="triangle-exclamation">
+    Track email bounces and Zoho API errors to catch delivery issues early.
+  </Card>
+</CardGroup>
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Violations not being created">
+    **Check:**
+    - Did detection action return `is_success=true`?
+    - Did consolidation logic evaluate to `true`?
+    - Did attachment upload succeed?
+    
+    **Look for:** `insert-violation` calls in the logs and "Successfully created X violation(s)" messages.
+  </Accordion>
+  
+  <Accordion title="Missing attachments">
+    **Check:**
+    - Did detection action save files to disk?
+    - Is Supabase storage accessible?
+    - Are file paths in results valid?
+    
+    **Resolution:**
+    - Verify detection action is saving images
+    - Check Supabase bucket permissions
+    - Check network connectivity
+  </Accordion>
+  
+  <Accordion title="Email not received">
+    **Check:**
+    - Is `business_action_email` configured on brand?
+    - Did SMTP connection succeed?
+    - Is email in spam folder?
+    
+    **Look for:** "Email sent successfully" or "Failed to send email" in logs.
+  </Accordion>
+  
+  <Accordion title="Zoho ticket not created">
+    **Check:**
+    - Is `zoho.enabled` set to `true`?
+    - Are OAuth credentials valid?
+    - Does department/contact exist?
+    
+    **Look for:** "Zoho ticket created with ID" or error messages with status codes in logs.
+  </Accordion>
+</AccordionGroup>
+
+## Related documentation
+
+<CardGroup cols={2}>
+  <Card title="Create violation action" icon="plus" href="/res/actions/create-violation">
+    Detailed documentation on the create_violation business action.
+  </Card>
+  
+  <Card title="Violation lifecycle" icon="rotate" href="/res/flows/violation-lifecycle">
+    Full flow from detection to brand delivery.
+  </Card>
+</CardGroup>

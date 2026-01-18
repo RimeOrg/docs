@@ -1,0 +1,142 @@
+---
+title: "RES overview"
+description: "Understanding the RIME Execution System architecture and core concepts"
+---
+
+The RIME Execution System (RES) is the engine that powers automated monitoring, detection, and violation handling. It processes branch rules, executes workflows, and manages the complete lifecycle of violations from detection to brand notification.
+
+## What RES does
+
+RES provides three core capabilities:
+
+1. **Automated rule execution** - Processes scheduled branch rules based on cron expressions and operation time windows
+2. **Intelligent detection** - Runs computer vision models to detect objects, people, and events in camera streams
+3. **Violation management** - Creates, escalates, and delivers violations to brands through multiple channels
+
+## Architecture overview
+
+RES uses a master-worker job queue architecture that efficiently processes multiple rules simultaneously while sharing AI model memory across workers.
+
+**System components:**
+
+| Component | Role |
+|-----------|------|
+| **Master thread** | Fetches ready jobs from the execution plan and adds them to the queue |
+| **Job queue** | Thread-safe Python queue with deduplication to prevent duplicate executions |
+| **Worker threads** | Pull jobs from the queue and execute workflows |
+| **Execution plan manager** | Caches branch rules in memory and syncs with the database |
+| **Workflow engine** | Executes action sequences defined in workflow configurations |
+| **Actions layer** | Detection actions, business actions, and data actions |
+
+**Data flow:**
+
+1. Master thread queries the execution plan for ready branch rules
+2. Ready rules are added to the job queue with deduplication
+3. Worker threads pull jobs and execute their workflows
+4. Workflow results trigger business actions (violations, notifications)
+5. Post-processing updates the next run time and releases the job
+
+## Key concepts
+
+<AccordionGroup>
+  <Accordion title="Branch rule">
+    A branch rule connects a rule definition to a specific branch (location). It defines:
+    - **Operation time window** - When the rule should run (e.g., 8:00 AM to 6:00 PM)
+    - **Next run time** - When the rule should execute next
+    - **Cron expression** - The schedule for recurring executions
+  </Accordion>
+  
+  <Accordion title="Workflow">
+    A workflow is a sequence of actions that execute in order. Workflows can include:
+    - Detection actions (computer vision analysis)
+    - Business actions (create violations, send notifications)
+    - Conditional branching based on detection results
+  </Accordion>
+  
+  <Accordion title="Action detail">
+    An action detail is a specific configuration of an action for a branch rule. It includes:
+    - Stream configuration (which camera to analyze)
+    - Model labels (what objects to detect)
+    - Zone definitions (areas of interest in the frame)
+    - Confidence thresholds
+  </Accordion>
+  
+  <Accordion title="Violation">
+    A violation is a record of a detected rule breach. It contains:
+    - Timestamp when the violation occurred
+    - Attachments (images, video clips)
+    - Status tracking for escalation
+  </Accordion>
+</AccordionGroup>
+
+## How RES processes rules
+
+<Steps>
+  <Step title="Fetch ready rules">
+    The master thread queries the execution plan for branch rules that are:
+    - Active and not archived
+    - Within their operation time window
+    - Past their next run time
+    - Not currently running
+  </Step>
+  
+  <Step title="Queue for execution">
+    Ready rules are added to the job queue with deduplication to prevent the same rule from running twice simultaneously.
+  </Step>
+  
+  <Step title="Execute workflow">
+    A worker thread claims the job, marks it as running, and executes the workflow:
+    1. Process detection actions (analyze camera streams)
+    2. Evaluate consolidation logic (combine results from multiple streams)
+    3. Execute business actions if conditions are met (create violations, send alerts)
+  </Step>
+  
+  <Step title="Post-process and reschedule">
+    After workflow completion:
+    1. Update the branch rule's `next_run_time` based on cron expression
+    2. Mark the rule as not running
+    3. Log execution results
+  </Step>
+</Steps>
+
+## Memory and resource management
+
+RES implements several strategies to efficiently manage memory and prevent resource exhaustion:
+
+<CardGroup cols={2}>
+  <Card title="Memory throttling" icon="memory">
+    Automatically pauses job fetching when RAM exceeds 90% or GPU memory exceeds 85%, resuming when usage drops below safe thresholds.
+  </Card>
+  
+  <Card title="Single-job mode" icon="recycle">
+    Workers exit after each job completion, ensuring complete memory cleanup including thread-local storage.
+  </Card>
+  
+  <Card title="Stream pooling" icon="video">
+    Camera streams are shared across workers through reference counting, reducing connection overhead.
+  </Card>
+  
+  <Card title="Model sharing" icon="brain">
+    AI models are loaded once and shared across all worker threads, minimizing GPU memory usage.
+  </Card>
+</CardGroup>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Running a branch rule" icon="play" href="/res/flows/running-branch-rule">
+    Walk through the complete flow of executing a branch rule from start to finish.
+  </Card>
+  
+  <Card title="Violation lifecycle" icon="triangle-exclamation" href="/res/flows/violation-lifecycle">
+    Understand how violations are created, escalated, and delivered to brands.
+  </Card>
+  
+  <Card title="Detection actions" icon="eye" href="/res/actions/detect">
+    Learn about the detect action and how to configure computer vision analysis.
+  </Card>
+  
+  <Card title="Business actions" icon="briefcase" href="/res/actions/create-violation">
+    Explore available business actions for handling detected events.
+  </Card>
+</CardGroup>

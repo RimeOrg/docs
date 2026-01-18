@@ -1,0 +1,196 @@
+---
+title: "Running a branch rule"
+description: "Complete walkthrough of how RES executes a branch rule from fetch to completion"
+---
+
+This guide explains the complete flow of executing a branch rule in RES, from the moment it's fetched from the database to when its next run time is updated.
+
+## Prerequisites
+
+Before a branch rule can execute, these conditions must be met:
+
+<Note>
+  All of these are automatically checked by the execution plan manager. You don't need to manually verify them.
+</Note>
+
+- **Active status** - The rule's status must be `active`
+- **Not archived** - `is_archived` must be `false`
+- **Not force stopped** - `is_force_stopped` must be `false`
+- **Branch active** - The associated branch must be active
+- **Within operation window** - Current time must be within `operation_time_from` and `operation_time_to`
+- **Past next run time** - Current time must be past `next_run_time`
+- **Not currently running** - `is_currently_running` must be `false`
+
+## Execution flow
+
+### Step 1: Master thread fetches jobs
+
+The master thread runs on a configurable interval (default: 60 seconds) and queries the execution plan for ready rules. It fetches up to 10 jobs per cycle, filtering rules using the criteria listed above.
+
+### Step 2: Job enters the queue
+
+Each fetched rule is added to the job queue with deduplication. The queue uses a HashMap to prevent duplicates.
+
+**Deduplication checks:**
+- Job not already in the queue (HashMap lookup)
+- Job not recently processed (within 30 seconds)
+- Job not currently active (being executed by another worker)
+
+### Step 3: Worker claims the job
+
+A worker thread pulls the job from the queue and immediately marks it as running in the execution plan. This atomic claim prevents race conditions where multiple workers might try to execute the same job.
+
+The worker then calls `pre_process()` on the branch rule, which attempts to claim the job in the database. If another worker already claimed it, the function returns `false` and the worker moves on to the next job.
+
+### Step 4: Workflow execution
+
+The workflow engine processes the branch rule's action sequence. This involves several sub-steps:
+
+<Steps>
+  <Step title="Load workflow configuration">
+    The workflow config is retrieved from `rule.action_template_connection.workflow_config`. This defines the sequence of actions and conditions.
+  </Step>
+  
+  <Step title="Execute start node">
+    Execution begins at the `start` node defined in the workflow config.
+  </Step>
+  
+  <Step title="Process action nodes">
+    Each node executes its action:
+    - Detection actions analyze camera streams
+    - Business actions create violations or send notifications
+    
+    Results are collected in `aggregated_actions_details`.
+  </Step>
+  
+  <Step title="Evaluate edge conditions">
+    After each action, edge conditions are evaluated to determine the next node. For example:
+    - If `feature_result` equals `detection_complete`, proceed to business action
+    - If `is_success` is `false`, skip business action
+  </Step>
+  
+  <Step title="Apply consolidation logic">
+    When transitioning from detection to business actions, the consolidation logic is evaluated. This is a Python expression that determines whether business actions should run based on aggregated results.
+    
+    If consolidation returns `false`, business actions are skipped. This is a normal business outcome, not a failure.
+  </Step>
+</Steps>
+
+### Step 5: Post-process and reschedule
+
+After workflow completion, `post_process()` is called with the execution results.
+
+**Post-process updates:**
+1. Sets `is_currently_running` to `false`
+2. Calculates and sets `next_run_time` based on cron expression
+3. Updates `last_run_time` to current time
+4. Increments execution counters
+
+### Step 6: Execution plan update
+
+The local execution plan is updated with the new `next_run_time`. This ensures the local cache matches the database, preventing the rule from being picked up again immediately.
+
+## Timeline overview
+
+A typical execution follows this timeline:
+
+| Time | Component | Action |
+|------|-----------|--------|
+| T+0s | Master thread | Fetch jobs from execution plan |
+| T+0.1s | Master thread | Add job to queue (with deduplication) |
+| T+0.2s | Worker thread | Pull job from queue, mark as running |
+| T+0.3s | Worker thread | Call `pre_process()` to claim in database |
+| T+0.5s | Workflow engine | Execute workflow (detect → create_violation) |
+| T+45s | Worker thread | Call `post_process()` to update next run time |
+| T+45.1s | Worker thread | Update local execution plan |
+| T+60s | Master thread | Next fetch cycle begins |
+
+## Operation time window enforcement
+
+RES enforces operation time windows to ensure rules only run during specified hours.
+
+### Deadline calculation
+
+When a job starts, a deadline is calculated based on `operation_time_to`. For example, if the operation window ends at 18:00, the deadline is set to 18:00 on the current day.
+
+**Overnight window handling:** For windows like 22:00 to 06:00, the system correctly handles the day boundary. If the current time is after 22:00, the deadline is set to 06:00 the next day.
+
+### Graceful shutdown
+
+If the deadline is reached during execution:
+
+1. A signal is set: `operation_window_exceeded = true`
+2. Detection actions check this signal and stop gracefully
+3. The workflow completes with status `operation_window_exceeded`
+4. Results up to that point are saved
+
+## Error handling
+
+### Workflow failures
+
+If a workflow fails with an exception:
+
+- The error is logged with full details
+- `post_process()` is called with `is_last_run_failed = true`
+- `is_currently_running` is reset to `false`
+- The rule is rescheduled based on cron (retry at next scheduled time)
+
+### Claim failures
+
+If `pre_process()` fails to claim the job (another worker claimed it first):
+
+- The worker abandons this job
+- `is_currently_running` stays `true` (the other worker has it)
+- The worker moves on to the next job in the queue
+
+This handles the rare case where two workers try to claim the same job simultaneously.
+
+## Monitoring execution
+
+### Execution logs
+
+Each workflow execution creates an execution log with:
+- Start and end times
+- Workflow status (running, completed, failed)
+- Node results with action details
+- System metrics (memory, CPU)
+- Error messages if failed
+
+### Queue statistics
+
+The job queue manager provides statistics including:
+
+| Metric | Description |
+|--------|-------------|
+| `queue_size` | Jobs waiting in the queue |
+| `active_jobs` | Jobs currently being executed |
+| `alive_workers` | Number of active worker threads |
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Rule not being picked up">
+    Check these conditions:
+    - Is the rule status `active`?
+    - Is current time within `operation_time_from` and `operation_time_to`?
+    - Is `next_run_time` in the past?
+    - Is `is_currently_running` set to `false`?
+    
+    You can query the execution plan to see which rules are ready for execution.
+  </Accordion>
+  
+  <Accordion title="Rule running but not completing">
+    Check for:
+    - Memory throttling (RAM > 90% pauses new jobs)
+    - Worker thread death (check `alive_workers` in stats)
+    - Stream connection issues (check stream pool stats)
+    - Long-running detections (check `max_runtime_seconds` setting)
+  </Accordion>
+  
+  <Accordion title="Duplicate executions">
+    This shouldn't happen due to deduplication, but if it does:
+    - Check if `is_currently_running` is being properly set
+    - Verify the HashMap deduplication is working
+    - Check for database synchronization issues between RES instances
+  </Accordion>
+</AccordionGroup>

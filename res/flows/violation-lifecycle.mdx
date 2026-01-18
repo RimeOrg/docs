@@ -1,0 +1,314 @@
+---
+title: "Violation lifecycle"
+description: "How violations are created, escalated, and delivered to brands"
+---
+
+This guide covers the complete lifecycle of a violation in RES, from initial creation through escalation and delivery to brands.
+
+## What is a violation?
+
+A violation is a record of a detected rule breach. When a detection action finds objects that match the configured criteria, and the workflow's consolidation logic evaluates to `true`, a violation is created.
+
+**Violation data includes:**
+
+| Field | Description |
+|-------|-------------|
+| `branch_rule_id` | The rule that triggered the violation |
+| `started_at` / `ended_at` | When the violation occurred |
+| `main_attachment` | Video clip or full image URLs |
+| `sub_attachment` | Detection crop or thumbnail URLs |
+| `timestamp` | Creation time |
+| `note` | Additional context from the detection |
+| `status` | Current status for escalation tracking |
+
+## Creating violations
+
+### The create_violation action
+
+The `create_violation` business action collects attachments from previous detection actions and creates violation records. It iterates through all non-business actions in the workflow, extracts their attachments, uploads them to Supabase storage, and creates violation records via the `insert-violation` edge function.
+
+For detailed information about the create_violation action, see the [create violation documentation](/res/actions/create-violation).
+
+### Attachment modes
+
+<Tabs>
+  <Tab title="Single attachments">
+    By default, each detection creates a separate violation. This creates a one-to-one mapping between detections and violations.
+    
+    **Example flow:**
+    - Detection 1 produces attachment 1 → Violation 1 created
+    - Detection 2 produces attachment 2 → Violation 2 created
+    - Detection 3 produces attachment 3 → Violation 3 created
+    
+    This is useful when you want to track each detection separately for individual review.
+  </Tab>
+  
+  <Tab title="Combined attachments">
+    When `is_multiple_attachments_in_business_action_output` is enabled on the rule, all detections are combined into a single violation with multiple attachments.
+    
+    **Example flow:**
+    - Detection 1, 2, and 3 all contribute to a single violation
+    - The violation contains all attachments in arrays
+    
+    This is useful when multiple detections represent a single incident (e.g., multiple people in one event).
+  </Tab>
+</Tabs>
+
+### Attachment types
+
+The violation system supports multiple attachment formats:
+
+| Type | Description | Example |
+|------|-------------|---------|
+| `file` | Local file path | `/data/detect/abc123_detection.jpg` |
+| `url` | Already-uploaded URL | `https://storage.supabase.co/...` |
+| `base64` | Base64-encoded image | Inline image data |
+
+All attachments are uploaded to Supabase storage before the violation is created, ensuring they're accessible via public URLs.
+
+## Setting nextRunTime
+
+After a workflow completes, the branch rule's `next_run_time` is calculated based on its cron expression and operation time window.
+
+### Cron-based scheduling
+
+The next run time is calculated using the cron expression defined on the rule. For example, a cron expression of `*/15 * * * *` means the rule runs every 15 minutes.
+
+### Operation window handling
+
+The `next_run_time` calculation respects operation windows:
+
+<Steps>
+  <Step title="Calculate next cron occurrence">
+    Based on the cron expression, find the next time the rule should run.
+  </Step>
+  
+  <Step title="Check operation window">
+    If the calculated time is outside the operation window, adjust to the next valid time within the window.
+  </Step>
+  
+  <Step title="Handle overnight windows">
+    For windows like 22:00 to 06:00, correctly handle the day boundary by checking if the window spans midnight.
+  </Step>
+</Steps>
+
+**Example scenarios:**
+
+| Current time | Cron | Operation window | Next run |
+|--------------|------|------------------|----------|
+| 14:00 | Every 30 min | 08:00-18:00 | 14:30 |
+| 17:45 | Every 30 min | 08:00-18:00 | 08:00 next day |
+| 23:00 | Every hour | 22:00-06:00 | 00:00 (midnight) |
+
+### Local fallback
+
+If the database update fails, RES calculates `next_run_time` locally to ensure the rule continues to be scheduled correctly. This prevents rules from getting stuck if there's a temporary database issue.
+
+## Escalation process
+
+Violations can be escalated to brands through multiple channels based on configuration. The escalation flow checks each configured integration and sends notifications accordingly.
+
+### Escalation flow
+
+1. **Violation created** - The create_violation action completes successfully
+2. **Check brand configuration** - The system checks which integrations are enabled for the brand
+3. **Send notifications** - Each enabled integration receives the violation data
+
+### Integration priority
+
+When multiple integrations are configured, they execute in this order:
+
+| Priority | Integration | Purpose |
+|----------|-------------|---------|
+| 1 | Webhook | Immediate programmatic notification to external systems |
+| 2 | Email | Human-readable notification to configured recipients |
+| 3 | Zoho | Ticket creation in Zoho Desk for tracking |
+
+Each method is independent - if one fails, others still execute.
+
+## Integration methods
+
+### Webhook integration
+
+Send violation data to an external system via HTTP POST.
+
+<Tabs>
+  <Tab title="Configuration">
+    Configure the webhook URL on the brand settings:
+    
+    | Field | Description |
+    |-------|-------------|
+    | `webhook_url` | The endpoint URL to receive violation data |
+    | `webhook_secret` | Optional secret for request signing |
+  </Tab>
+  
+  <Tab title="Payload contents">
+    The webhook payload includes:
+    
+    | Field | Description |
+    |-------|-------------|
+    | `violation_id` | Unique identifier for the violation |
+    | `branch_rule_id` | The rule that triggered the violation |
+    | `branch_id` | The branch where the violation occurred |
+    | `brand_id` | The brand that owns the branch |
+    | `timestamp` | When the violation was created |
+    | `main_attachment` | Array of video/image URLs |
+    | `sub_attachment` | Array of detection crop URLs |
+    | `rule_name` | Human-readable rule name |
+    | `branch_name` | Human-readable branch name |
+    | `note` | Additional context from detection |
+  </Tab>
+  
+  <Tab title="Error handling">
+    If webhook delivery fails:
+    
+    1. Retry up to 3 times with exponential backoff
+    2. Log the failure with error details
+    3. Continue with other notification methods
+    
+    Webhook failures don't prevent other integrations from running.
+  </Tab>
+</Tabs>
+
+### Email integration
+
+Send violation alerts via email to configured recipients.
+
+**Email contents:**
+- Video or image attachment (embedded or linked)
+- Detection detail thumbnail
+- Violation timestamp
+- Rule description
+- Branch and brand information
+
+**Configuration requirements:**
+
+| Field | Description |
+|-------|-------------|
+| `business_action_email` | Recipient email address on the brand |
+| SMTP credentials | Server configuration for sending |
+
+### Zoho integration
+
+Create support tickets in Zoho Desk for violations, enabling brands to track and manage violations through their existing ticketing workflow.
+
+<Tabs>
+  <Tab title="Setup requirements">
+    Configure Zoho OAuth credentials on the brand:
+    
+    | Field | Description |
+    |-------|-------------|
+    | `zoho.enabled` | Must be `true` to enable integration |
+    | `zoho.org_id` | Zoho organization ID |
+    | `zoho.department_id` | Target department for tickets |
+    | `zoho.contact_id` | Contact to associate with tickets |
+    | `zoho.client_id` | OAuth client ID |
+    | `zoho.client_secret` | OAuth client secret |
+    | `zoho.refresh_token` | OAuth refresh token |
+    | `zoho.api_region` | API region (e.g., "sa" for Saudi Arabia) |
+  </Tab>
+  
+  <Tab title="Ticket creation">
+    When a violation is escalated to Zoho, a ticket is created with:
+    
+    | Field | Value |
+    |-------|-------|
+    | Subject | Rule name |
+    | Department | Configured department ID |
+    | Description | HTML-formatted violation details |
+    | Contact | Configured contact ID |
+    | Category | Brand ID and branch ID combination |
+    | Custom fields | Branch group, brand name, branch name |
+  </Tab>
+  
+  <Tab title="Rate limiting">
+    Zoho API has rate limits. RES handles this with:
+    
+    - **Retry logic** - Up to 5 retries with 120-second delays
+    - **Token refresh** - Automatic OAuth token refresh when expired
+    - **Error logging** - Detailed logs for debugging API issues
+    
+    If the API returns 429 (rate limited) or 503 (service unavailable), RES waits and retries.
+  </Tab>
+</Tabs>
+
+## Configuring integrations
+
+### Per-brand configuration
+
+Each brand can have different integration settings. Configure these in the brand settings:
+
+| Integration | Required fields |
+|-------------|-----------------|
+| **Email** | `business_action_email` |
+| **Zoho** | `zoho.enabled`, `zoho.org_id`, `zoho.department_id`, `zoho.contact_id`, OAuth credentials |
+| **Webhook** | `webhook_url`, optionally `webhook_secret` |
+
+### Testing integrations
+
+Before deploying to production:
+
+1. **Email** - Send a test violation to verify delivery and formatting
+2. **Zoho** - Create a test ticket to verify OAuth and department configuration
+3. **Webhook** - Use a tool like webhook.site to inspect payload format
+
+## Error handling and troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Violation not created">
+    Check:
+    - Did the detection action return `is_success = true`?
+    - Did consolidation logic evaluate to `true`?
+    - Were attachments successfully uploaded to Supabase?
+    
+    Look for `insert-violation` calls in the logs to see the response.
+  </Accordion>
+  
+  <Accordion title="Email not sent">
+    Verify:
+    - `business_action_email` is set on the brand
+    - Attachment URLs are valid (not local paths)
+    - SMTP credentials are correct
+    
+    Common error: "No attachments found" means previous actions didn't produce valid attachment paths.
+  </Accordion>
+  
+  <Accordion title="Zoho ticket not created">
+    Check:
+    - `zoho.enabled` is `true` on the brand
+    - OAuth tokens are valid (not expired)
+    - Department ID and contact ID exist in Zoho
+    
+    If getting 401 errors, the refresh token may need to be regenerated in Zoho.
+  </Accordion>
+  
+  <Accordion title="nextRunTime not updating">
+    Ensure:
+    - Cron expression is valid syntax
+    - Operation time window is properly formatted (`HH:MM:SS`)
+    - Post-process is completing successfully
+    
+    Check the execution plan cache to see the current `next_run_time` value.
+  </Accordion>
+</AccordionGroup>
+
+## Monitoring violations
+
+### Key metrics to track
+
+| Metric | Description |
+|--------|-------------|
+| Violations per hour | Rate of violation creation |
+| Attachment upload success rate | Percentage of successful uploads |
+| Integration delivery rate | Success rate for each notification method |
+| Average processing time | Time from detection to violation creation |
+
+### Execution logs
+
+Each violation creation is logged with details including:
+- Number of violations created
+- Attachment URLs
+- Integration delivery status
+- Any errors encountered
+
+Review these logs to troubleshoot issues and monitor system health.

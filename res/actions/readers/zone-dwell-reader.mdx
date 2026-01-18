@@ -1,0 +1,239 @@
+---
+title: "Zone dwell reader"
+description: "Query zone dwell events from the local SQLite database"
+---
+
+The `zone_dwell_reader` data action reads zone dwell events from the local RESDB SQLite database. It executes custom SELECT queries and returns matching records for downstream actions to process.
+
+## What it does
+
+The zone dwell reader:
+
+1. **Accepts custom SELECT queries** via `feature_variables.select_query`
+2. **Validates query safety** to prevent write operations (INSERT, UPDATE, DELETE)
+3. **Executes the query** against the `zone_dwell_events` table
+4. **Parses JSON columns** like `attachments`, `detection_result`, and `extra_info`
+5. **Calculates ongoing duration** for records without exit times
+6. **Returns all matching records** in a single response
+
+## Requirements
+
+| Requirement | Description |
+|-------------|-------------|
+| **select_query** | A valid SELECT query in `feature_variables`. Required. |
+| **RESDB database** | The local SQLite database must be initialized |
+
+## Configuration
+
+Configure the action through `feature_variables` on the action detail:
+
+| Variable | Type | Required | Description |
+|----------|------|----------|-------------|
+| `select_query` | string | Yes | Full SELECT query to execute |
+
+<Warning>
+  The query must start with SELECT. Any write operations (INSERT, UPDATE, DELETE, DROP, etc.) are blocked for security.
+</Warning>
+
+## Available columns
+
+The `zone_dwell_events` table contains these columns:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | integer | Auto-incrementing primary key |
+| `timestamp` | datetime | When the event was recorded |
+| `camera_name` | text | Name of the camera/stream |
+| `tracked_object_id` | text | Stable ID for the tracked object |
+| `zone_name` | text | Name of the detection zone |
+| `entry_time` | datetime | When the object entered the zone |
+| `exit_time` | datetime | When the object exited (NULL if ongoing) |
+| `duration_seconds` | real | Time spent in zone (NULL if ongoing) |
+| `is_read` | boolean | Whether the record has been processed |
+| `model_label_id` | integer | Detection model label ID |
+| `created_at` | datetime | Database insertion timestamp |
+| `branch_id` | integer | Associated branch ID |
+| `stream_id` | integer | Associated stream ID |
+| `stream_zone_id` | integer | Associated stream zone ID |
+| `is_violated` | boolean | Whether a violation was created |
+| `attachments` | text (JSON) | Array of ResultAttachment objects |
+| `detection_result` | text (JSON) | Detection metadata |
+| `extra_info` | text (JSON) | Additional data (including violated_branch_rules) |
+
+## Example queries
+
+### Query ongoing dwell events
+
+Find people who have been in a zone for more than 60 seconds and haven't left yet:
+
+**Query:**
+```
+SELECT * FROM zone_dwell_events 
+WHERE exit_time IS NULL 
+AND (strftime('%s', 'now') - strftime('%s', entry_time)) > 60 
+ORDER BY entry_time ASC 
+LIMIT 50
+```
+
+**Use case:** Loitering detection - find people dwelling too long in restricted areas.
+
+### Query completed dwell events by duration
+
+Find completed visits that lasted between 5 and 30 minutes:
+
+**Query:**
+```
+SELECT * FROM zone_dwell_events 
+WHERE exit_time IS NOT NULL 
+AND duration_seconds BETWEEN 300 AND 1800 
+ORDER BY duration_seconds DESC 
+LIMIT 100
+```
+
+**Use case:** Customer engagement analysis - identify visitors who spent meaningful time in a zone.
+
+### Query events with attachments
+
+Find recent events that have captured frames attached:
+
+**Query:**
+```
+SELECT * FROM zone_dwell_events 
+WHERE attachments IS NOT NULL 
+AND timestamp > datetime('now', '-1 hour') 
+ORDER BY timestamp DESC 
+LIMIT 20
+```
+
+**Use case:** Review recent detections with visual evidence.
+
+### Query by zone and stream
+
+Find events in a specific zone from a specific camera:
+
+**Query:**
+```
+SELECT * FROM zone_dwell_events 
+WHERE zone_name = 'Entry Area' 
+AND stream_id = 42 
+AND timestamp > datetime('now', '-24 hours') 
+ORDER BY timestamp DESC
+```
+
+**Use case:** Zone-specific reporting for a particular camera.
+
+### Query unprocessed events
+
+Find events that haven't been used for violations yet:
+
+**Query:**
+```
+SELECT * FROM zone_dwell_events 
+WHERE is_violated = 0 
+AND exit_time IS NOT NULL 
+AND duration_seconds > 120 
+ORDER BY timestamp ASC 
+LIMIT 50
+```
+
+**Use case:** Batch processing of completed dwell events for violation creation.
+
+### Query events not violated by specific rule
+
+Find events that haven't been processed by a specific branch rule:
+
+**Query:**
+```
+SELECT * FROM zone_dwell_events 
+WHERE (extra_info IS NULL 
+   OR extra_info NOT LIKE '%"branch-rule-uuid"%') 
+AND duration_seconds > 60 
+ORDER BY timestamp DESC 
+LIMIT 100
+```
+
+**Use case:** Rule-specific violation processing to prevent duplicate violations.
+
+## Result format
+
+### Success with records
+
+| Field | Value |
+|-------|-------|
+| `is_success` | `true` |
+| `feature_result` | `records_found` |
+| `note` | "Found X zone dwell records" |
+| `extras.records` | Array of record objects |
+| `extras.total_records` | Number of records returned |
+| `extras.query_used` | The executed query (truncated if long) |
+| `extras.columns` | Array of column names |
+
+### No records found
+
+| Field | Value |
+|-------|-------|
+| `is_success` | `true` |
+| `feature_result` | `no_records_found` |
+| `note` | "No zone dwell records found matching criteria" |
+| `extras.records` | Empty array |
+| `extras.total_records` | 0 |
+
+### Record structure
+
+Each record in `extras.records` contains:
+
+| Field | Description |
+|-------|-------------|
+| All database columns | Original column values |
+| `record_id` | Copy of `id` for convenience |
+| `is_ongoing` | `true` if `exit_time` is NULL |
+| `duration_seconds` | Calculated from entry_time to now if ongoing |
+| `attachments` | Parsed JSON array (if present) |
+| `detection_result` | Parsed JSON object (if present) |
+| `extra_info` | Parsed JSON object (if present) |
+
+## Possible errors
+
+<AccordionGroup>
+  <Accordion title="No query provided">
+    **Error:** `no_query_provided`
+    
+    **What happened:** The `select_query` feature variable was not set.
+    
+    **How to fix:** Add a `select_query` to the action's `feature_variables` configuration.
+  </Accordion>
+  
+  <Accordion title="Invalid query">
+    **Error:** `invalid_query`
+    
+    **What happened:** The query doesn't start with SELECT or contains forbidden keywords.
+    
+    **How to fix:** 
+    - Ensure query starts with SELECT
+    - Remove any INSERT, UPDATE, DELETE, DROP, or other write statements
+    - Use only single statements (no semicolons for multiple statements)
+  </Accordion>
+  
+  <Accordion title="Database error">
+    **Error:** `error`
+    
+    **What happened:** SQL execution failed due to syntax error or database issue.
+    
+    **How to fix:**
+    - Verify SQL syntax is valid SQLite
+    - Check column names exist in the table
+    - Ensure database file is accessible
+  </Accordion>
+</AccordionGroup>
+
+## Workflow integration
+
+The zone dwell reader is typically used as the first step in a violation workflow:
+
+1. **zone_dwell_reader** queries for events matching violation criteria
+2. **zone_dwell_violation_snapshot** annotates frames from the records
+3. **create_violation** creates violation records from the prepared attachments
+
+<Note>
+  The zone dwell reader returns all matching records in a single response. Downstream actions should iterate through `extras.records` to process each record.
+</Note>

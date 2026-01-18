@@ -1,0 +1,379 @@
+---
+title: "Detect action"
+description: "Computer vision detection with advanced multi-object tracking, zone dwell analysis, and re-identification"
+---
+
+The detect action is the primary detection action in RES. It analyzes camera streams using YOLO-based models to detect objects, track them across frames with stable identities, and monitor how long they remain in specific zones.
+
+## What it does
+
+The detect action provides a complete detection and tracking pipeline:
+
+1. **Captures frames** from one or more RTSP camera streams using the optimized StreamManager
+2. **Runs inference** using configured YOLO models (TensorRT or PyTorch)
+3. **Filters detections** based on allowed classes, detection zones, and exclusion zones
+4. **Tracks objects** across frames using BoTSORT with re-identification support
+5. **Monitors zone dwell time** calculating how long each tracked object stays in a zone
+6. **Saves evidence** including detection crops, annotated frames, and video clips
+
+## Requirements
+
+<Note>
+  The action fails if these requirements aren't met. Configure them in the action detail before running.
+</Note>
+
+| Requirement | Description |
+|-------------|-------------|
+| **Stream** | At least one valid RTSP stream URL configured in `action_detail.streams` |
+| **Model labels** | At least one detection model with configured labels |
+| **Confidence threshold** | Value between 0.0 and 1.0 (default: 0.5) |
+| **Detection zones** | At least one detection zone per stream (streams without zones are skipped) |
+
+### Optional settings
+
+| Setting | Description | Default |
+|---------|-------------|---------|
+| `max_runtime_seconds` | Maximum seconds to run before timing out | 60 (0 = unlimited for tracking mode) |
+| `processing_fps` | Frame rate for analysis | Stream native |
+| `enable_tracking_and_zone_dwell` | Enable object tracking and dwell time monitoring | false |
+
+## Operating modes
+
+The detect action operates in two distinct modes depending on your configuration.
+
+### Standard detection mode
+
+When `enable_tracking_and_zone_dwell` is set to `false`, the action runs in standard detection mode:
+
+- Processes frames until a detection is found or timeout is reached
+- Returns immediately when objects matching your criteria are detected
+- Saves a single detection image and video clip
+- Best for: Alert-based rules where you need to know if something appeared
+
+### Continuous tracking mode
+
+When `enable_tracking_and_zone_dwell` is set to `true`, the action runs continuously:
+
+- Processes frames indefinitely (set `max_runtime_seconds` to 0)
+- Tracks objects across frames with stable identities
+- Calculates zone dwell time for each tracked object
+- Yields results continuously for downstream edge conditions
+- Best for: Monitoring scenarios where you need to track presence duration
+
+## Multi-stream support
+
+The detect action can process multiple camera streams simultaneously:
+
+| Feature | Single stream | Multi-stream |
+|---------|---------------|--------------|
+| **Processing** | Sequential frame capture | Batch capture across all streams |
+| **Zones** | Zones apply to the single stream | Each stream has its own zone configuration |
+| **Tracking** | One tracker instance | Separate tracker per stream with unique IDs |
+| **Output** | Single set of attachments | Attachments labeled by stream ID |
+
+When using multi-stream mode, each stream must have at least one detection or exclusion zone configured. Streams without zones are automatically released and skipped.
+
+## Detection zones
+
+Zones define regions of interest in each camera frame. Coordinates are specified as percentages (0-100) of the frame dimensions.
+
+### Zone types
+
+| Type | Behavior |
+|------|----------|
+| **Detection** | Only detections inside these zones are considered valid |
+| **Exclusion** | Detections inside these zones are ignored |
+| **ROI** | Region of interest for display purposes only |
+
+### Zone filtering logic
+
+1. If a detection falls inside any exclusion zone, it's discarded
+2. If detection zones are configured, the detection must be inside at least one detection zone
+3. If no detection zones are configured, all non-excluded detections are valid
+
+<Tip>
+  Keep zones simple with fewer points. Complex polygons with many vertices increase filtering overhead on every frame.
+</Tip>
+
+## Object tracking deep dive
+
+When tracking is enabled, the detect action uses BoTSORT (Bag of Tricks for SORT) with re-identification to maintain stable object identities across frames.
+
+### How tracking works
+
+<Steps>
+<Step title="Detection to tracker">
+  Each frame's detections are passed to the TrackerWrapper, which manages the BoTSORT tracker instance. The tracker receives bounding boxes, confidence scores, and class IDs.
+</Step>
+
+<Step title="Track association">
+  BoTSORT uses a combination of motion prediction (Kalman filter) and appearance features (ReID) to associate new detections with existing tracks. This allows objects to be re-identified even after brief occlusions.
+</Step>
+
+<Step title="Unique ID assignment">
+  Each tracked object receives a globally unique track ID formatted as: `{stream_id:02d}{model_id:03d}{tracker_id:06d}`. This ensures IDs are unique across streams and models.
+</Step>
+
+<Step title="Track persistence">
+  Track IDs persist across frames as long as the object is visible. The system maintains mappings between tracker-assigned IDs and globally unique IDs, with automatic cleanup of stale tracks after 120 seconds.
+</Step>
+</Steps>
+
+### Track ID format
+
+Track IDs are constructed to be globally unique:
+
+| Component | Format | Example |
+|-----------|--------|---------|
+| Stream ID | 2 digits | `01` |
+| Model ID | 3 digits | `001` |
+| Tracker ID | 6 digits | `000042` |
+| **Full ID** | 11 digits | `01001000042` |
+
+This format ensures that even when processing multiple streams with multiple models, every tracked object has a unique identifier.
+
+### Re-identification (ReID)
+
+BoTSORT includes appearance-based re-identification:
+
+- Extracts visual features from each detected object
+- Compares features when associating detections to tracks
+- Helps recover tracks after occlusions or brief disappearances
+- Particularly effective for person tracking
+
+<Note>
+  ReID requires the tracker configuration to have `with_reid: true`. The default BoTSORT configuration in RES has this enabled.
+</Note>
+
+### Track lifecycle
+
+| State | Description |
+|-------|-------------|
+| **New** | Detection doesn't match any existing track, new track created |
+| **Active** | Track successfully associated with detection this frame |
+| **Lost** | Track not matched for several frames, using motion prediction |
+| **Removed** | Track lost for too long, removed from tracker |
+
+## Zone dwell time
+
+When tracking is enabled, the ZoneDwellEngineStable calculates how long each tracked object remains in detection zones.
+
+### How dwell time works
+
+<Steps>
+<Step title="Zone entry detection">
+  When a tracked object's bounding box enters a detection zone, the engine records the entry timestamp and zone index.
+</Step>
+
+<Step title="Continuous monitoring">
+  Each frame, the engine updates the position of all tracked objects and checks zone membership. Objects can move between zones, and the engine tracks entry/exit events.
+</Step>
+
+<Step title="Dwell time calculation">
+  The dwell time is calculated as the difference between the current time and the zone entry time. This is displayed in the format `MM:SS` on the detection label.
+</Step>
+
+<Step title="Label enrichment">
+  Detection labels are enriched with the stable ID and dwell time: `{class_name} ID:{stable_id} {dwell_time}`. For example: `person ID:A1 02:34`.
+</Step>
+</Steps>
+
+### Stable IDs
+
+The zone dwell engine assigns human-readable stable IDs to tracked objects:
+
+| Format | Example | Description |
+|--------|---------|-------------|
+| Letter + Number | `A1`, `B2`, `C3` | Sequential assignment within each stream |
+| Root ID tracking | Maintained across zone transitions | Same object keeps same ID when moving between zones |
+
+### Zone events
+
+The engine logs zone entry and exit events to the database:
+
+| Event | Data recorded |
+|-------|---------------|
+| **Entry** | Track ID, zone ID, entry timestamp, stream ID |
+| **Exit** | Track ID, zone ID, exit timestamp, dwell duration |
+
+## Image-from-previous-actions mode
+
+The detect action can also run detection on images from previous workflow actions instead of live streams.
+
+### When this mode activates
+
+- No streams are configured in the action detail, AND
+- Previous actions have attachments in their results
+
+### Supported attachment formats
+
+| Format | Source |
+|--------|--------|
+| `attachments` list | New unified ResultAttachment schema |
+| `cropped_object_frames` | Legacy base64 image list |
+| `records[].attachments` | From zone_dwell_reader action |
+
+This mode is useful for cascading detection workflows where you want to run a secondary model on crops from an initial detection.
+
+## Result format
+
+### During processing (tracking mode)
+
+While the action is running in tracking mode, it yields results with:
+
+| Field | Value |
+|-------|-------|
+| `feature_result` | `detection_in_progress` |
+| `is_success` | `true` |
+| `extras.frame_count` | Number of frames processed |
+| `extras.detection_count` | Total detections this frame |
+| `extras.all_detections` | List of detection objects with tracking info |
+| `extras.stream_results` | Per-stream detection data |
+
+### On completion
+
+| Outcome | `feature_result` | Description |
+|---------|------------------|-------------|
+| Objects detected | `objects_detected` | At least one valid detection found |
+| No objects | `no_objects_detected` | No objects matched criteria within timeout |
+| Timeout | `max_runtime_exceeded` | Max runtime reached (saves last frame) |
+| Edge condition | `stopped_by_edge_condition` | Workflow edge condition triggered stop |
+| Operation window | `operation_window_exceeded` | Outside configured operation hours |
+| Stream error | `stream_error` | Failed to connect to camera |
+
+## Possible errors
+
+<AccordionGroup>
+  <Accordion title="No model labels configured">
+    **Error message:** No model labels configured for this action detail
+    
+    **What happened:** The action detail doesn't have any model labels assigned.
+    
+    **How to fix:** 
+    - Open the action detail configuration
+    - Add at least one model label with a valid `model_id`, `name`, and `model_label_id_reference`
+    - The `model_label_id_reference` must be a valid class ID from the detection model
+  </Accordion>
+  
+  <Accordion title="Failed to load detection models">
+    **Error message:** Failed to load any detection models
+    
+    **What happened:** None of the configured models could be loaded from disk.
+    
+    **How to fix:**
+    - Verify model files exist at the configured paths
+    - Check file permissions allow reading the model files
+    - For TensorRT engines, ensure they were compiled for the correct GPU architecture
+    - Try using the `.pt` model as a fallback if `.engine` fails
+  </Accordion>
+  
+  <Accordion title="Failed to acquire stream">
+    **Error message:** Failed to acquire any streams
+    
+    **What happened:** Could not connect to any of the configured camera streams.
+    
+    **How to fix:**
+    - Verify the RTSP URL is correct and accessible
+    - Check network connectivity between RES and the camera
+    - Ensure the camera is powered on and accepting connections
+    - Check for firewall rules blocking RTSP traffic (port 554)
+    - Verify stream credentials if authentication is required
+  </Accordion>
+  
+  <Accordion title="No streams have matching zones">
+    **Error message:** No streams have matching zones configured
+    
+    **What happened:** All configured streams were skipped because none had detection or exclusion zones.
+    
+    **How to fix:**
+    - Add at least one detection zone to each stream you want to process
+    - Zones must be associated with the correct `stream_id`
+    - Check that zone coordinates are valid percentages (0-100)
+  </Accordion>
+  
+  <Accordion title="Frame capture failed">
+    **Error message:** Stream capture failed - status changed to 'failed_to_capture'
+    
+    **What happened:** The stream was connected but frames stopped arriving.
+    
+    **How to fix:**
+    - The StreamManager will automatically attempt recovery
+    - If the issue persists, check camera health and network bandwidth
+    - The stream may have timed out due to network issues
+    - Camera may be restarting or experiencing hardware issues
+  </Accordion>
+</AccordionGroup>
+
+## Performance considerations
+
+<CardGroup cols={2}>
+  <Card title="Model selection" icon="brain">
+    Use TensorRT engines for best performance. They're 2-5x faster than PyTorch models on NVIDIA GPUs. Ensure engines are compiled for your specific GPU architecture.
+  </Card>
+  
+  <Card title="Stream resolution" icon="display">
+    The action automatically optimizes stream resolution based on model input size. Lower resolutions reduce bandwidth and processing time.
+  </Card>
+  
+  <Card title="Zone complexity" icon="shapes">
+    Keep zones simple with fewer vertices. Complex polygons increase filtering overhead. Use rectangular zones when possible.
+  </Card>
+  
+  <Card title="Multi-stream batching" icon="layer-group">
+    When using multiple streams, frames are captured and processed in batches for efficiency. This reduces per-frame overhead.
+  </Card>
+</CardGroup>
+
+## Memory management
+
+The detect action implements several optimizations to manage memory during long-running tracking sessions:
+
+| Optimization | Interval | Description |
+|--------------|----------|-------------|
+| Track pruning | 120 seconds | Stale track IDs removed after not being seen |
+| Track mapping limit | 500 entries | Oldest mappings removed when limit exceeded |
+| Garbage collection | Every 3000 frames | Python GC triggered to free memory |
+| CUDA cache clearing | With GC | GPU memory cache emptied periodically |
+| Memory threshold | 2000 MB | Heavy cleanup triggered when exceeded |
+
+<Warning>
+  For very long-running tracking sessions (hours), monitor memory usage. The automatic cleanup should prevent issues, but edge cases may require action restarts.
+</Warning>
+
+## Practical examples
+
+### Example 1: Detecting unauthorized access
+
+**Scenario:** You want to detect when people enter a restricted area during business hours.
+
+**Configuration:**
+- Set up one detection zone covering the restricted area
+- Configure a person detection model with appropriate confidence threshold
+- Set `max_runtime_seconds` to 60 for quick detection
+- Leave tracking disabled since you only need to know if someone entered
+
+**Expected behavior:** The action captures frames and returns as soon as a person is detected in the zone. A detection image and video clip are saved for review.
+
+### Example 2: Monitoring queue wait times
+
+**Scenario:** You want to track how long customers wait in a queue area.
+
+**Configuration:**
+- Draw a detection zone covering the queue area
+- Enable `enable_tracking_and_zone_dwell` 
+- Set `max_runtime_seconds` to 0 for continuous operation
+- Configure edge conditions to trigger when dwell time exceeds threshold
+
+**Expected behavior:** The action continuously tracks people in the queue, assigning stable IDs and calculating dwell time. Detection labels show `person ID:A1 05:23` indicating person A1 has been waiting 5 minutes 23 seconds. Edge conditions can trigger violations when wait times exceed limits.
+
+### Example 3: Multi-camera perimeter monitoring
+
+**Scenario:** You want to monitor multiple entry points simultaneously.
+
+**Configuration:**
+- Add multiple streams to the action detail
+- Configure detection zones for each stream's entry point
+- Enable tracking to maintain identities across frames
+- Set appropriate confidence thresholds for outdoor conditions
+
+**Expected behavior:** All streams are processed in parallel. Each stream has independent tracking with globally unique IDs. Detections from any stream can trigger the workflow's edge conditions.

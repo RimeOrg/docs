@@ -1,0 +1,291 @@
+---
+title: "Line crossing reader"
+description: "Query visitor entry and exit events from the local SQLite database"
+---
+
+The `line_crossing_events_reader` data action reads visitor entry and exit events from the local RESDB SQLite database. It queries the `visitor_entries` table populated by the `visitor_entry_counting` action.
+
+## What it does
+
+The line crossing reader:
+
+1. **Accepts custom SELECT queries** via `feature_variables.select_query`
+2. **Validates query safety** to prevent write operations
+3. **Executes the query** against the `visitor_entries` table
+4. **Parses JSON columns** like `raw_data`
+5. **Computes convenience fields** like `event_type`, `gender`, and `age_range`
+6. **Returns all matching records** in a single response
+
+## Requirements
+
+| Requirement | Description |
+|-------------|-------------|
+| **select_query** | A valid SELECT query in `feature_variables`. Required. |
+| **RESDB database** | The local SQLite database must be initialized |
+
+## Configuration
+
+Configure the action through `feature_variables` on the action detail:
+
+| Variable | Type | Required | Description |
+|----------|------|----------|-------------|
+| `select_query` | string | Yes | Full SELECT query to execute |
+
+<Warning>
+  The query must start with SELECT. Any write operations are blocked for security.
+</Warning>
+
+## Available columns
+
+The `visitor_entries` table contains these columns:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | integer | Auto-incrementing primary key |
+| `timestamp` | datetime | When the event occurred |
+| `camera_name` | text | Name of the camera/stream |
+| `entry_count` | integer | 1 if this is an entry event, 0 otherwise |
+| `exit_count` | integer | 1 if this is an exit event, 0 otherwise |
+| `male_count` | integer | 1 if person is male, 0 otherwise |
+| `female_count` | integer | 1 if person is female, 0 otherwise |
+| `age_0_10` | integer | 1 if age is 0-10, 0 otherwise |
+| `age_10_20` | integer | 1 if age is 10-20, 0 otherwise |
+| `age_20_30` | integer | 1 if age is 20-30, 0 otherwise |
+| `age_30_40` | integer | 1 if age is 30-40, 0 otherwise |
+| `age_40_50` | integer | 1 if age is 40-50, 0 otherwise |
+| `age_50_60` | integer | 1 if age is 50-60, 0 otherwise |
+| `age_60_plus` | integer | 1 if age is 60+, 0 otherwise |
+| `wide_range` | text | Original wide age range if AI gave broad estimate |
+| `raw_data` | text (JSON) | Additional metadata (entry_type, gender, age_range, stream_id) |
+| `stream_id` | integer | ID of the stream where event was detected |
+| `entry_line_id` | integer | ID of the entry line configuration |
+| `is_read` | boolean | Whether the record has been processed |
+
+## Example queries
+
+### Query entries in the last hour
+
+Find all entry events from the past hour:
+
+**Query:**
+```
+SELECT * FROM visitor_entries 
+WHERE entry_count = 1 
+AND timestamp > datetime('now', '-1 hour') 
+ORDER BY timestamp DESC
+```
+
+**Use case:** Real-time monitoring of store entries.
+
+### Query exits today
+
+Find all exit events from today:
+
+**Query:**
+```
+SELECT * FROM visitor_entries 
+WHERE exit_count = 1 
+AND date(timestamp) = date('now') 
+ORDER BY timestamp DESC
+```
+
+**Use case:** Daily exit count reporting.
+
+### Query by gender
+
+Find all male entries:
+
+**Query:**
+```
+SELECT * FROM visitor_entries 
+WHERE entry_count = 1 
+AND male_count = 1 
+AND timestamp > datetime('now', '-24 hours') 
+ORDER BY timestamp DESC
+```
+
+**Use case:** Demographic analysis of visitors.
+
+### Query by age group
+
+Find visitors in the 20-30 age range:
+
+**Query:**
+```
+SELECT * FROM visitor_entries 
+WHERE age_20_30 = 1 
+AND timestamp > datetime('now', '-24 hours') 
+ORDER BY timestamp DESC
+```
+
+**Use case:** Age-based visitor analysis.
+
+### Count entries by hour
+
+Get hourly entry counts for today:
+
+**Query:**
+```
+SELECT strftime('%H', timestamp) as hour, 
+       SUM(entry_count) as entries, 
+       SUM(exit_count) as exits 
+FROM visitor_entries 
+WHERE date(timestamp) = date('now') 
+GROUP BY hour 
+ORDER BY hour
+```
+
+**Use case:** Traffic pattern analysis throughout the day.
+
+### Count by demographics
+
+Get gender and age breakdown:
+
+**Query:**
+```
+SELECT 
+    SUM(male_count) as males, 
+    SUM(female_count) as females,
+    SUM(age_0_10) as age_0_10,
+    SUM(age_10_20) as age_10_20,
+    SUM(age_20_30) as age_20_30,
+    SUM(age_30_40) as age_30_40,
+    SUM(age_40_50) as age_40_50,
+    SUM(age_50_60) as age_50_60,
+    SUM(age_60_plus) as age_60_plus
+FROM visitor_entries 
+WHERE timestamp > datetime('now', '-24 hours')
+```
+
+**Use case:** Daily demographic summary report.
+
+### Query by specific camera
+
+Find events from a specific camera:
+
+**Query:**
+```
+SELECT * FROM visitor_entries 
+WHERE camera_name = 'Main Entrance' 
+AND timestamp > datetime('now', '-1 hour') 
+ORDER BY timestamp DESC 
+LIMIT 100
+```
+
+**Use case:** Camera-specific visitor analysis.
+
+### Query unprocessed entries
+
+Find entries that haven't been synchronized:
+
+**Query:**
+```
+SELECT * FROM visitor_entries 
+WHERE is_read = 0 
+ORDER BY timestamp ASC 
+LIMIT 500
+```
+
+**Use case:** Batch upload to central database.
+
+## Result format
+
+### Success with records
+
+| Field | Value |
+|-------|-------|
+| `is_success` | `true` |
+| `feature_result` | `records_found` |
+| `note` | "Found X line crossing event records" |
+| `extras.records` | Array of record objects |
+| `extras.total_records` | Number of records returned |
+| `extras.query_used` | The executed query (truncated if long) |
+| `extras.columns` | Array of column names |
+
+### No records found
+
+| Field | Value |
+|-------|-------|
+| `is_success` | `true` |
+| `feature_result` | `no_records_found` |
+| `note` | "No line crossing event records found matching criteria" |
+| `extras.records` | Empty array |
+| `extras.total_records` | 0 |
+
+### Record structure
+
+Each record in `extras.records` contains:
+
+| Field | Description |
+|-------|-------------|
+| All database columns | Original column values |
+| `record_id` | Copy of `id` for convenience |
+| `event_type` | Computed: `'entry'` or `'exit'` |
+| `gender` | Computed: `'Male'`, `'Female'`, or `'Unknown'` |
+| `age_range` | Computed: `'0-10'`, `'10-20'`, ..., `'60+'`, or `'Unknown'` |
+| `is_entry` | `true` if `entry_count` is 1 |
+| `is_exit` | `true` if `exit_count` is 1 |
+| `raw_data` | Parsed JSON object (if present) |
+
+## Possible errors
+
+<AccordionGroup>
+  <Accordion title="No query provided">
+    **Error:** `no_query_provided`
+    
+    **What happened:** The `select_query` feature variable was not set.
+    
+    **How to fix:** Add a `select_query` to the action's `feature_variables` configuration.
+  </Accordion>
+  
+  <Accordion title="Invalid query">
+    **Error:** `invalid_query`
+    
+    **What happened:** The query doesn't start with SELECT or contains forbidden keywords.
+    
+    **How to fix:** 
+    - Ensure query starts with SELECT
+    - Remove any INSERT, UPDATE, DELETE, DROP, or other write statements
+  </Accordion>
+  
+  <Accordion title="Database error">
+    **Error:** `error`
+    
+    **What happened:** SQL execution failed due to syntax error or database issue.
+    
+    **How to fix:**
+    - Verify SQL syntax is valid SQLite
+    - Check column names exist in the table
+    - Ensure database file is accessible
+  </Accordion>
+</AccordionGroup>
+
+## Data flow
+
+The visitor entry data flows through the system as follows:
+
+<Steps>
+  <Step title="Detection">
+    The `visitor_entry_counting` action detects people crossing virtual lines using YOLO models.
+  </Step>
+  
+  <Step title="Demographic analysis">
+    For each crossing, gender and age are estimated via RunPod AI analysis.
+  </Step>
+  
+  <Step title="Storage">
+    Events are stored in the `visitor_entries` table with all demographic flags.
+  </Step>
+  
+  <Step title="Querying">
+    The `line_crossing_events_reader` queries events for reporting or further processing.
+  </Step>
+  
+  <Step title="Synchronization">
+    A separate action uploads unread records to the central Supabase database.
+  </Step>
+</Steps>
+
+<Note>
+  The computed fields (`event_type`, `gender`, `age_range`) are added by the reader for convenience. They're derived from the flag columns and not stored in the database.
+</Note>

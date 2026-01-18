@@ -1,0 +1,240 @@
+---
+title: "Execution plan"
+description: "Intelligent caching and management of branch rules"
+---
+
+The execution plan manager provides a high-performance, thread-safe cache for branch rules. It maintains an in-memory snapshot of workflows, periodically syncs with the database, and handles crash recovery.
+
+## What it does
+
+The execution plan manager:
+
+1. **Caches branch rules** in memory for fast access
+2. **Syncs with database** periodically via edge function
+3. **Filters ready rules** based on time windows and status
+4. **Handles crash recovery** by resetting stale running flags
+5. **Persists to disk** for durability across restarts
+
+## Key components
+
+### In-memory plan
+
+The plan contains two main sections:
+
+**Workflows** - Branch rules ready for execution, containing:
+
+| Field | Description |
+|-------|-------------|
+| `id` | Branch rule UUID |
+| `is_active` | Whether the rule is enabled |
+| `is_currently_running` | Whether a worker is executing this rule |
+| `next_run_time` | When the rule should next execute (UTC) |
+| `operation_time_from` | Start of operation window (local time) |
+| `operation_time_to` | End of operation window (local time) |
+| `branch` | Associated branch data |
+| `rule` | Rule configuration |
+| `brand_rule` | Brand-specific rule settings |
+
+**Lookup tables** - Related data for hydration:
+
+| Table | Contents |
+|-------|----------|
+| `branches` | Branch records by UUID |
+| `rules` | Rule definitions by UUID |
+| `brands` | Brand configurations by UUID |
+| `action_details` | Action configurations by UUID |
+| `action_templates` | Action template definitions by UUID |
+
+### Refresher thread
+
+Periodically syncs with the database by calling the `get-execution-plan-v2` edge function. The default refresh interval is 20 seconds.
+
+**Behavior:**
+- Runs continuously in the background
+- Calls the edge function to get current plan state
+- Performs incremental merge preserving local state
+- Handles errors gracefully without crashing
+
+### File writer thread
+
+Persists the plan to disk atomically for durability across restarts.
+
+**Behavior:**
+- Writes are queued to avoid blocking the main thread
+- Uses atomic rename to prevent corruption
+- Debounces writes to avoid excessive disk I/O
+
+## Filtering ready rules
+
+The `get_ready_branch_rules()` method returns rules ready to execute based on multiple criteria.
+
+### Filter criteria
+
+| Filter | Description |
+|--------|-------------|
+| `is_active` | Branch rule is enabled |
+| `is_archived` | Branch rule is not archived (must be `false`) |
+| `is_force_stopped` | Branch rule is not force stopped (must be `false`) |
+| `is_currently_running` | Branch rule is not already running (must be `false`) |
+| `branch.is_active` | Associated branch is active |
+| `rule.status` | Rule status is `active` |
+| `next_run_time` | Current UTC time is past `next_run_time` |
+| Operation window | Current local time is within `operation_time_from` and `operation_time_to` |
+
+### Time handling
+
+- **next_run_time** is compared in UTC
+- **Operation window** is compared in local time (KSA)
+- Overnight windows (e.g., 22:00 to 06:00) are handled correctly
+
+## Smart merging
+
+When refreshing from the database, the plan manager performs intelligent merging to preserve local state.
+
+### Merge strategy
+
+<Steps>
+  <Step title="Preserve local state">
+    If a workflow is marked as running locally, preserve that flag even if the server says otherwise. This prevents race conditions where the server hasn't been updated yet.
+  </Step>
+  
+  <Step title="Preserve recent updates">
+    If a workflow was updated locally (via post_process) within the refresh interval, preserve local values. This ensures recent changes aren't overwritten by stale server data.
+  </Step>
+  
+  <Step title="Add new workflows">
+    New workflows from the server are added directly to the local plan.
+  </Step>
+  
+  <Step title="Remove stale workflows">
+    Workflows not in the server response (and not currently active) are pruned after 24 hours.
+  </Step>
+</Steps>
+
+### First refresh handling
+
+On the first refresh after startup (crash recovery), the server is trusted completely. This ensures that jobs that were running when the process crashed are properly reset.
+
+## Crash recovery
+
+### On startup
+
+When RES starts, it resets all running flags in the local plan. This ensures jobs that were running when the process crashed can be picked up again.
+
+### Marker file
+
+During graceful shutdown, a marker file is written containing:
+
+| Field | Description |
+|-------|-------------|
+| `shutdown_started_at` | Timestamp when shutdown began |
+| `pid` | Process ID |
+| `signal` | Signal that triggered shutdown |
+
+This helps distinguish between graceful restarts and crashes.
+
+## Updating the plan
+
+### After job completion
+
+When a job completes, `post_process` updates the database and returns new data. The plan manager then updates the local cache with the response, ensuring the local plan matches the database.
+
+### Marking jobs as running
+
+When a worker claims a job, the plan manager immediately marks it as running. This prevents other workers from fetching the same job.
+
+### Local next_run_time calculation
+
+If the database update fails, the plan manager calculates `next_run_time` locally based on the cron expression. This ensures rules continue to be scheduled correctly even during database issues.
+
+## Workflow cache
+
+The execution plan provides workflow caches for action details. These caches allow `ActionDetail.get_action_details()` to skip database queries by pre-loading action details by branch rule and action template.
+
+## Configuration
+
+### Environment variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `EXECUTION_PLAN_REFRESH_SECONDS` | 20 | Seconds between database syncs |
+
+### Internal constants
+
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `PLAN_MIN_WRITE_INTERVAL_SECONDS` | 1 | Minimum time between file writes |
+| `PLAN_ACTION_DETAILS_CAP` | 1500 | Maximum cached action details |
+| `PLAN_WORKFLOW_MAX_AGE_HOURS` | 24 | Hours before pruning inactive workflows |
+
+## Monitoring
+
+### Write thread status
+
+Monitor the file writer thread health:
+
+| Metric | Description |
+|--------|-------------|
+| `write_thread_alive` | Whether the write thread is running |
+| `write_thread_started` | Whether the write thread was started |
+| `write_queue_size` | Number of pending writes |
+| `write_queue_full` | Whether the write queue is full |
+
+### Log messages
+
+Key messages to monitor:
+
+| Message | Meaning |
+|---------|---------|
+| `✅ Updated execution plan: workflow {id}` | Local plan updated |
+| `🔄 Updated workflow {id}: next_run_time X → Y` | Next run time changed |
+| `🔄 Reset {count} workflow(s) is_currently_running flag` | Crash recovery completed |
+| `💾 Queued execution plan write` | Plan queued for disk write |
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Rules not being picked up">
+    **Check the execution plan directly:**
+    - Is `is_active` set to `true`?
+    - Is `is_currently_running` set to `false`?
+    - Is `next_run_time` in the past?
+    - Is current time within the operation window?
+    
+    **Resolution:**
+    - Verify rule configuration in the database
+    - Check if the rule was recently executed (may be waiting for next cron occurrence)
+  </Accordion>
+  
+  <Accordion title="is_currently_running stuck as True">
+    **Causes:**
+    - Crash during job execution
+    - Worker died without cleanup
+    
+    **Resolution:**
+    - Restart the application (triggers crash recovery)
+    - The plan manager will reset all running flags on startup
+  </Accordion>
+  
+  <Accordion title="Stale next_run_time">
+    **Causes:**
+    - Post-process failed to update database
+    - Merge preserved old local value
+    
+    **Resolution:**
+    - Check post_process logs for errors
+    - Wait for next refresh cycle to sync with database
+  </Accordion>
+  
+  <Accordion title="File write failures">
+    **Check:**
+    - Disk space availability
+    - Directory permissions
+    - Write thread status
+    
+    **Resolution:**
+    - Free disk space
+    - Fix directory permissions
+    - Check write thread status for thread health
+  </Accordion>
+</AccordionGroup>

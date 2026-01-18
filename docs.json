@@ -1,7 +1,7 @@
 {
   "$schema": "https://mintlify.com/docs.json",
   "theme": "mint",
-  "name": "Mint Starter Kit",
+  "name": "RIME DOCS",
   "colors": {
     "primary": "#16A34A",
     "light": "#07C983",
@@ -11,58 +11,48 @@
   "navigation": {
     "tabs": [
       {
-        "tab": "Guides",
+        "tab": "RES",
         "groups": [
           {
             "group": "Getting started",
             "pages": [
-              "index",
-              "quickstart",
-              "development"
+              "res/introduction"
             ]
           },
           {
-            "group": "Customization",
+            "group": "Flows",
             "pages": [
-              "essentials/settings",
-              "essentials/navigation"
+              "res/flows/running-branch-rule",
+              "res/flows/violation-lifecycle"
             ]
           },
           {
-            "group": "Writing content",
+            "group": "Actions",
             "pages": [
-              "essentials/markdown",
-              "essentials/code",
-              "essentials/images",
-              "essentials/reusable-snippets"
+              "res/actions/detect",
+              "res/actions/create-violation",
+              "res/actions/readers/zone-dwell-reader",
+              "res/actions/readers/line-crossing-reader",
+              "res/actions/readers/zone-dwell-violation-snapshot"
             ]
           },
           {
-            "group": "AI tools",
+            "group": "RESDB",
             "pages": [
-              "ai-tools/cursor",
-              "ai-tools/claude-code",
-              "ai-tools/windsurf"
-            ]
-          }
-        ]
-      },
-      {
-        "tab": "API reference",
-        "groups": [
-          {
-            "group": "API documentation",
-            "pages": [
-              "api-reference/introduction"
+              "res/resdb/schema"
             ]
           },
           {
-            "group": "Endpoint examples",
+            "group": "Core components",
             "pages": [
-              "api-reference/endpoint/get",
-              "api-reference/endpoint/create",
-              "api-reference/endpoint/delete",
-              "api-reference/endpoint/webhook"
+              "res/core/job-queue",
+              "res/core/execution-plan"
+            ]
+          },
+          {
+            "group": "Violations",
+            "pages": [
+              "res/violations/overview"
             ]
           }
         ]
@@ -70,16 +60,7 @@
     ],
     "global": {
       "anchors": [
-        {
-          "anchor": "Documentation",
-          "href": "https://mintlify.com/docs",
-          "icon": "book-open-cover"
-        },
-        {
-          "anchor": "Blog",
-          "href": "https://mintlify.com/blog",
-          "icon": "newspaper"
-        }
+
       ]
     }
   },
@@ -93,12 +74,7 @@
         "label": "Support",
         "href": "mailto:hi@mintlify.com"
       }
-    ],
-    "primary": {
-      "type": "button",
-      "label": "Dashboard",
-      "href": "https://dashboard.mintlify.com"
-    }
+    ]
   },
   "contextual": {
     "options": [

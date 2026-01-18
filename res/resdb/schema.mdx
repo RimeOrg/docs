@@ -1,0 +1,363 @@
+---
+title: "RESDB schema"
+description: "Local SQLite database schema reference for RES"
+---
+
+RESDB is the local SQLite database that RES uses to store event data for high-speed querying. It uses WAL (Write-Ahead Logging) mode for concurrent read/write operations and maintains tables for zone dwell events and visitor entries.
+
+## Overview
+
+| Aspect | Detail |
+|--------|--------|
+| **Database file** | `data/RESDB.db` |
+| **Journal mode** | WAL (Write-Ahead Logging) |
+| **Sync mode** | NORMAL |
+| **Foreign keys** | Enabled |
+| **Cache size** | 64MB |
+| **Memory-mapped I/O** | 256MB |
+
+RESDB is initialized automatically when RES starts. Tables are created if they don't exist, and columns are added for schema migrations.
+
+## Tables
+
+### zone_dwell_events
+
+Stores zone dwell tracking data from the zone dwell engine. Records when tracked objects enter and exit detection zones.
+
+```sql
+CREATE TABLE zone_dwell_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp DATETIME NOT NULL,
+    camera_name TEXT,
+    tracked_object_id TEXT,
+    zone_name TEXT,
+    entry_time DATETIME,
+    exit_time DATETIME,
+    duration_seconds REAL,
+    is_read BOOLEAN DEFAULT FALSE,
+    model_label_id INTEGER DEFAULT 1,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    branch_id INTEGER,
+    stream_id INTEGER,
+    stream_zone_id INTEGER,
+    is_violated BOOLEAN DEFAULT FALSE,
+    attachments TEXT,
+    detection_result TEXT,
+    extra_info TEXT
+)
+```
+
+**Indexes:**
+- `idx_zone_dwell_events_timestamp_read` on `(timestamp, is_read)`
+
+#### Column reference
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | INTEGER | Auto-incrementing primary key |
+| `timestamp` | DATETIME | When the event was recorded |
+| `camera_name` | TEXT | Name identifier for the camera |
+| `tracked_object_id` | TEXT | Stable ID format: `{service_id}_{track_id}` |
+| `zone_name` | TEXT | Name of the detection zone |
+| `entry_time` | DATETIME | When the object entered the zone |
+| `exit_time` | DATETIME | When the object left (NULL if still in zone) |
+| `duration_seconds` | REAL | Calculated dwell duration (NULL if ongoing) |
+| `is_read` | BOOLEAN | Marks if record was synced to Supabase |
+| `model_label_id` | INTEGER | Detection model label (1 = person, etc.) |
+| `created_at` | DATETIME | Database insertion timestamp |
+| `branch_id` | INTEGER | Associated branch ID |
+| `stream_id` | INTEGER | Camera stream ID |
+| `stream_zone_id` | INTEGER | Specific zone configuration ID |
+| `is_violated` | BOOLEAN | Legacy flag for violation creation |
+| `attachments` | TEXT | JSON array of ResultAttachment objects |
+| `detection_result` | TEXT | JSON detection metadata |
+| `extra_info` | TEXT | JSON for additional data (violated_branch_rules, etc.) |
+
+#### JSON field: attachments
+
+The `attachments` column stores a JSON array of ResultAttachment objects:
+
+```json
+[
+  {
+    "type": "base64",
+    "value": "<base64-encoded-image>",
+    "category": "frame",
+    "metadata": {
+      "bbox": [x1, y1, x2, y2],
+      "track_id": 42
+    }
+  },
+  {
+    "type": "base64",
+    "value": "<base64-encoded-image>",
+    "category": "full_frame",
+    "metadata": {
+      "bbox": [x1, y1, x2, y2],
+      "zone_name": "Entry Area"
+    }
+  }
+]
+```
+
+**Attachment categories:**
+| Category | Description |
+|----------|-------------|
+| `frame` | Cropped object detection (tight crop around detected object) |
+| `full_frame` | Full camera frame with bbox metadata (used for annotations) |
+
+#### JSON field: extra_info
+
+The `extra_info` column stores additional metadata:
+
+```json
+{
+  "violated_branch_rules": [
+    "uuid-of-branch-rule-1",
+    "uuid-of-branch-rule-2"
+  ],
+  "anpr_plate": "ABC123",
+  "custom_field": "value"
+}
+```
+
+**Common fields:**
+| Field | Description |
+|-------|-------------|
+| `violated_branch_rules` | Array of branch rule IDs that created violations from this record |
+| `anpr_plate` | License plate detected by ANPR (if applicable) |
+
+---
+
+### visitor_entries
+
+Stores line crossing events for visitor counting with demographic data.
+
+```sql
+CREATE TABLE visitor_entries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp DATETIME NOT NULL,
+    camera_name TEXT,
+    entry_count INTEGER DEFAULT 0,
+    exit_count INTEGER DEFAULT 0,
+    male_count INTEGER DEFAULT 0,
+    female_count INTEGER DEFAULT 0,
+    age_0_10 INTEGER DEFAULT 0,
+    age_10_20 INTEGER DEFAULT 0,
+    age_20_30 INTEGER DEFAULT 0,
+    age_30_40 INTEGER DEFAULT 0,
+    age_40_50 INTEGER DEFAULT 0,
+    age_50_60 INTEGER DEFAULT 0,
+    age_60_plus INTEGER DEFAULT 0,
+    wide_range TEXT,
+    is_read BOOLEAN DEFAULT FALSE,
+    raw_data TEXT,
+    stream_id INTEGER,
+    entry_line_id INTEGER
+)
+```
+
+**Indexes:**
+- `idx_timestamp_read` on `(timestamp, is_read)`
+
+#### Column reference
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | INTEGER | Auto-incrementing primary key |
+| `timestamp` | DATETIME | When the crossing event occurred |
+| `camera_name` | TEXT | Name identifier for the camera |
+| `entry_count` | INTEGER | 1 if entry crossing, 0 otherwise |
+| `exit_count` | INTEGER | 1 if exit crossing, 0 otherwise |
+| `male_count` | INTEGER | 1 if male, 0 otherwise |
+| `female_count` | INTEGER | 1 if female, 0 otherwise |
+| `age_0_10` | INTEGER | 1 if age 0-10, 0 otherwise |
+| `age_10_20` | INTEGER | 1 if age 10-20, 0 otherwise |
+| `age_20_30` | INTEGER | 1 if age 20-30, 0 otherwise |
+| `age_30_40` | INTEGER | 1 if age 30-40, 0 otherwise |
+| `age_40_50` | INTEGER | 1 if age 40-50, 0 otherwise |
+| `age_50_60` | INTEGER | 1 if age 50-60, 0 otherwise |
+| `age_60_plus` | INTEGER | 1 if age 60+, 0 otherwise |
+| `wide_range` | TEXT | Original age estimate if AI returned broad range |
+| `is_read` | BOOLEAN | Marks if record was synced to Supabase |
+| `raw_data` | TEXT | JSON with additional metadata |
+| `stream_id` | INTEGER | Camera stream ID |
+| `entry_line_id` | INTEGER | Line configuration ID |
+
+#### JSON field: raw_data
+
+```json
+{
+  "entry_type": "entry",
+  "gender": "Male",
+  "age_range": "20-30",
+  "stream_id": 42,
+  "detection_confidence": 0.87
+}
+```
+
+<Note>
+  The demographic flag columns (`male_count`, `age_20_30`, etc.) are set to 1 or 0 for each record. This allows efficient aggregation using SUM() queries without parsing JSON.
+</Note>
+
+## Using the SQLiteService
+
+RES provides a thread-safe `SQLiteService` class for database operations:
+
+### Reading data
+
+```python
+from helpers.sqlite_service import SQLiteService
+
+# Simple query
+rows = SQLiteService.execute_query(
+    "SELECT * FROM zone_dwell_events WHERE duration_seconds > ?",
+    (60,)
+)
+
+# Get single row
+row = SQLiteService.execute_query(
+    "SELECT * FROM zone_dwell_events WHERE id = ?",
+    (123,),
+    fetch_one=True
+)
+```
+
+### Writing data
+
+```python
+# Insert
+new_id = SQLiteService.execute_write(
+    "INSERT INTO zone_dwell_events (timestamp, zone_name) VALUES (?, ?)",
+    (now, "Entry Area")
+)
+
+# Update
+affected = SQLiteService.execute_write(
+    "UPDATE zone_dwell_events SET is_violated = 1 WHERE id = ?",
+    (123,)
+)
+```
+
+### Batch operations
+
+```python
+# Insert many records
+SQLiteService.execute_many(
+    "INSERT INTO visitor_entries (timestamp, entry_count) VALUES (?, ?)",
+    [(now1, 1), (now2, 1), (now3, 0)]
+)
+```
+
+### Transaction handling
+
+```python
+# For complex operations needing explicit transaction control
+with SQLiteService.get_connection('IMMEDIATE') as conn:
+    cursor = conn.cursor()
+    cursor.execute("UPDATE ...")
+    cursor.execute("INSERT ...")
+    # Auto-commits on successful exit
+```
+
+## Common query patterns
+
+### Zone dwell queries
+
+**Find ongoing dwell events:**
+```sql
+SELECT * FROM zone_dwell_events 
+WHERE exit_time IS NULL 
+ORDER BY entry_time ASC
+```
+
+**Find long dwell events not yet violated:**
+```sql
+SELECT * FROM zone_dwell_events 
+WHERE duration_seconds > 300 
+AND is_violated = 0 
+ORDER BY timestamp DESC
+```
+
+**Find events by zone:**
+```sql
+SELECT * FROM zone_dwell_events 
+WHERE zone_name = 'Restricted Area' 
+AND timestamp > datetime('now', '-1 hour')
+```
+
+### Visitor entry queries
+
+**Daily entry/exit totals:**
+```sql
+SELECT 
+    date(timestamp) as day,
+    SUM(entry_count) as total_entries,
+    SUM(exit_count) as total_exits
+FROM visitor_entries 
+WHERE timestamp > datetime('now', '-7 days')
+GROUP BY day
+ORDER BY day DESC
+```
+
+**Demographic breakdown:**
+```sql
+SELECT 
+    SUM(male_count) as males,
+    SUM(female_count) as females,
+    SUM(age_20_30) + SUM(age_30_40) as young_adults,
+    SUM(age_40_50) + SUM(age_50_60) + SUM(age_60_plus) as older_adults
+FROM visitor_entries 
+WHERE date(timestamp) = date('now')
+```
+
+**Hourly traffic pattern:**
+```sql
+SELECT 
+    strftime('%H', timestamp) as hour,
+    SUM(entry_count) as entries
+FROM visitor_entries 
+WHERE date(timestamp) = date('now')
+GROUP BY hour
+ORDER BY hour
+```
+
+## Maintenance
+
+### WAL checkpoint
+
+Periodically run a checkpoint to sync WAL to the main database:
+
+```python
+SQLiteService.checkpoint()
+```
+
+### Vacuum
+
+Run VACUUM during maintenance windows to optimize the database:
+
+```python
+SQLiteService.vacuum()
+```
+
+### Database statistics
+
+Check database health:
+
+```python
+stats = SQLiteService.get_database_stats()
+print(f"DB size: {stats['db_size_mb']:.2f} MB")
+print(f"WAL size: {stats.get('wal_size_mb', 0):.2f} MB")
+print(f"Journal mode: {stats['journal_mode']}")
+```
+
+## Data synchronization
+
+RESDB data is periodically synchronized to the central Supabase database:
+
+| Table | Sync method | Frequency |
+|-------|-------------|-----------|
+| `zone_dwell_events` | `zone_dwell_time_summary_upload` action | Configurable (typically hourly) |
+| `visitor_entries` | `visitor_summary_uploader` action | Configurable (typically every 15 min) |
+
+After syncing, records are marked with `is_read = TRUE` to prevent duplicate uploads.

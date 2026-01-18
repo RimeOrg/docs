@@ -1,0 +1,240 @@
+---
+title: "Create violation action"
+description: "Create violation records from detection results with attachment handling"
+---
+
+The `create_violation` business action collects detection results from previous workflow actions and creates violation records in the database. It handles attachment uploads to cloud storage and supports both single and combined attachment modes.
+
+## What it does
+
+The create_violation action:
+
+1. **Collects attachments** from all previous detection actions in the workflow
+2. **Uploads files** to Supabase storage in the `violations` bucket
+3. **Creates violation records** via the `insert-violation` edge function
+4. **Returns violation IDs** for use by subsequent actions
+
+## Requirements
+
+| Requirement | Description |
+|-------------|-------------|
+| **Previous detection actions** | At least one detection action must have completed with attachments |
+| **Branch rule** | Valid branch rule ID for the violation |
+| **Storage bucket** | Supabase storage bucket `violations` must exist |
+
+## Configuration
+
+The create_violation action doesn't require extensive configuration - it automatically collects data from previous actions. Simply add it to your workflow after detection actions.
+
+### Rule-level options
+
+Configure attachment behavior on the rule:
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `is_multiple_attachments_in_business_action_output` | boolean | `false` | When `true`, all attachments are combined into a single violation |
+
+## How it works
+
+### Attachment collection
+
+The action iterates through all previous non-business actions and extracts attachments from their results.
+
+**Attachment sources (in priority order):**
+
+1. `result.extras['attachments']` - New unified ResultAttachment schema
+2. `result.extras['full_attachment_paths']` or `result.extras['detection_attachment_paths']` - Legacy list format
+3. `result.full_attachment_path` or `result.detection_attachment_path` - Legacy string format
+
+### Attachment types
+
+| Type | Category | Description |
+|------|----------|-------------|
+| **Main attachment** | `full` | Video clips or full-frame images |
+| **Sub attachment** | `detection` | Cropped detection images |
+
+### Upload process
+
+All local files are uploaded to Supabase storage before creating violations. The action handles three input types:
+
+| Input type | Handling |
+|------------|----------|
+| **Local file paths** | Uploaded to the `violations` bucket |
+| **URLs** | Passed through unchanged (already accessible) |
+| **Base64 data** | Decoded, saved to a temporary file, then uploaded |
+
+The action caches upload results to avoid uploading the same file multiple times when creating separate violations.
+
+### Violation creation modes
+
+<Tabs>
+  <Tab title="Separate violations (default)">
+    Each detection creates a separate violation record. The action iterates through the collected attachments and creates one violation per detection.
+    
+    **Attachment pairing logic:**
+    - If there are equal numbers of main and sub attachments, they're paired one-to-one
+    - If there's only one main attachment (video), it's reused for all sub attachments (detection crops)
+    - If there are more sub attachments than main, extra detections get the single video
+    
+    **Use case:** When you want to track each detection as a separate incident for individual review and resolution.
+  </Tab>
+  
+  <Tab title="Combined violations">
+    All attachments go into a single violation record. Enable this by setting `is_multiple_attachments_in_business_action_output` to `true` on the rule.
+    
+    **Behavior:**
+    - All main attachment URLs are stored in the `main_attachment` array
+    - All sub attachment URLs are stored in the `sub_attachment` array
+    - Notes from all detection actions are combined with semicolons
+    
+    **Use case:** When multiple detections should be grouped as one incident (for example, multiple people detected in a single event, or multiple objects in one scene).
+  </Tab>
+</Tabs>
+
+## Result format
+
+### Success result
+
+When violations are created successfully, the result contains:
+
+| Field | Value |
+|-------|-------|
+| `is_success` | `true` |
+| `feature_result` | `violation created` |
+| `note` | Summary like "Created 3 violation(s)" |
+| `full_attachment_path` | List of uploaded main attachment URLs |
+| `detection_attachment_path` | List of uploaded sub attachment URLs |
+| `extras.violation_ids` | Array of all created violation UUIDs |
+| `extras.violation_id` | First violation ID (for backwards compatibility) |
+| `extras.attachments` | Unified attachment schema with type and category info |
+
+### Failure result
+
+When violation creation fails:
+
+| Field | Value |
+|-------|-------|
+| `is_success` | `false` |
+| `feature_result` | `failed` |
+| `note` | Error description (e.g., "No valid attachments could be uploaded") |
+
+## Possible errors
+
+<AccordionGroup>
+  <Accordion title="No previous detection actions found">
+    **Error message:** No previous detection actions found for violation creation
+    
+    **What happened:** There are no non-business actions before create_violation in the workflow.
+    
+    **How to fix:**
+    - Ensure detection actions run before create_violation in your workflow
+    - Check workflow configuration for proper action ordering
+    - Verify the detection action completed successfully
+  </Accordion>
+  
+  <Accordion title="No valid attachments">
+    **Error message:** No valid attachments found for violation
+    
+    **What happened:** Previous actions didn't produce any attachment paths, or all uploads failed.
+    
+    **How to fix:**
+    - Verify detection actions are saving images and videos correctly
+    - Check that file paths in detection results are valid and accessible
+    - Ensure Supabase storage is accessible from the RES server
+    - Check detection action logs for file saving errors
+  </Accordion>
+  
+  <Accordion title="Upload failed">
+    **Error message:** Failed to upload {path} to Supabase storage
+    
+    **What happened:** Storage upload failed due to permissions, connectivity, or file issues.
+    
+    **How to fix:**
+    - Check Supabase storage configuration and credentials
+    - Verify the `violations` bucket exists and has appropriate permissions
+    - Check network connectivity to Supabase
+    - Ensure the local file exists and is readable
+    - Check disk space on the RES server
+  </Accordion>
+  
+  <Accordion title="insert-violation failed">
+    **What happened:** The edge function returned an error when creating the violation record.
+    
+    **How to fix:**
+    - Check edge function logs in Supabase for specific error details
+    - Verify the `branch_rule_id` is valid and exists in the database
+    - Ensure database constraints aren't violated (unique keys, foreign keys)
+    - Check that required fields are not null
+  </Accordion>
+</AccordionGroup>
+
+## Practical examples
+
+### Example 1: Basic violation creation
+
+**Scenario:** You have a detection workflow that identifies people in restricted areas and want to create violation records for each detection.
+
+**Workflow setup:**
+1. Configure a detect action to monitor the restricted area
+2. Add create_violation as the next step after detection
+3. Leave `is_multiple_attachments_in_business_action_output` as `false` (default)
+
+**Expected behavior:** When someone is detected, the workflow creates a violation record with the detection crop image and video clip. Each detection becomes a separate violation that can be reviewed individually.
+
+### Example 2: Combined attachments for group events
+
+**Scenario:** You're monitoring a queue area and want to create a single violation when multiple people are detected waiting too long.
+
+**Workflow setup:**
+1. Configure a detect action with tracking enabled to monitor the queue
+2. Set up edge conditions to trigger when dwell time exceeds your threshold
+3. Add create_violation after the edge condition
+4. Set `is_multiple_attachments_in_business_action_output` to `true` on the rule
+
+**Expected behavior:** When the edge condition triggers, all detection crops and video clips are combined into a single violation. The brand receives one notification with all the evidence grouped together.
+
+### Example 3: Cascading detection workflow
+
+**Scenario:** You want to run a secondary detection model on crops from an initial detection (for example, detecting specific attributes on detected people).
+
+**Workflow setup:**
+1. First detect action identifies people
+2. Second detect action runs attribute detection on the crops (using image-from-previous-actions mode)
+3. create_violation collects attachments from both detection actions
+
+**Expected behavior:** The violation includes both the original person detection crops and any attribute detection results. Notes from both detection actions are combined in the violation record.
+
+## Attachment handling best practices
+
+<CardGroup cols={2}>
+  <Card title="Use unified schema" icon="layer-group">
+    Prefer the `result.extras['attachments']` format for new integrations. It supports type information, categories, and metadata for better tracking.
+  </Card>
+  
+  <Card title="Include both types" icon="images">
+    Always include both main (video) and sub (detection) attachments when possible. This provides complete evidence for violation review.
+  </Card>
+  
+  <Card title="Handle URLs efficiently" icon="link">
+    If attachments are already URLs from previous uploads, they're passed through without re-upload. This saves bandwidth and processing time.
+  </Card>
+  
+  <Card title="Monitor storage usage" icon="database">
+    Violation attachments accumulate in Supabase storage. Implement retention policies to manage storage costs over time.
+  </Card>
+</CardGroup>
+
+## Integration with workflows
+
+The create_violation action is typically placed after detection actions and before any notification steps. The violation IDs created are available in `result.extras['violation_ids']` for subsequent actions to reference.
+
+**Typical workflow flow:**
+
+1. **Detection action** captures evidence and identifies violations
+2. **Edge conditions** determine if a violation should be created
+3. **create_violation** uploads attachments and creates database records
+4. **Notification actions** alert brands about the new violations
+
+<Note>
+  The violation lifecycle continues after creation. See the [violation lifecycle documentation](/res/flows/violation-lifecycle) for details on escalation, nextRunTime management, and brand notifications.
+</Note>
